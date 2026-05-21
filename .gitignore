@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# IDE and metadata
+.vscode/
+.antigravitycli/
+.DS_Store
+
+# Tailscale and other system/host states
+**/tailscale_state/
+Danh_Tien_workspace/
+
+# Large datasets, models, predictions, checkpoints, and logs
+**/data/
+**/checkpoints*/
+**/prediction*/
+**/logs*/

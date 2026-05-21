@@ -1,0 +1,24 @@
+services:
+  dev-container:
+    image: lab-base:tailscale
+    container_name: aicity-track5-dev
+    shm_size: 16g
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - /home/tuancuong/data5t/ailab/shared_data:/data
+      - /home/tuancuong/data5t/ailab/shared_cache:/root/.cache
+      - /home/tuancuong/data5t/ailab/container/aicity-track5:/workspace
+      - ./tailscale_state:/var/lib/tailscale
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    working_dir: /workspace
+    command: tail -f /dev/null
