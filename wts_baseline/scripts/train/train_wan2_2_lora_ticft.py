@@ -47,6 +47,7 @@ from src.datasets.transforms import denormalize_image
 from src.models.adapters import (
     apply_lora_to_pipeline,
     TICFTBufferManager,
+    RollingWindowInferenceEngine,
 )
 from src.pipelines.wan_video_pipeline import build_wan_prompt
 
@@ -72,6 +73,7 @@ def setup_training_args():
     
     # Data
     parser.add_argument("--manifest", type=str, required=True, help="Training manifest path")
+    parser.add_argument("--val_manifest", type=str, default=None, help="Validation manifest path (optional)")
     parser.add_argument("--output_dir", type=str, default="checkpoints_lora", help="Output directory")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--max_samples", type=int, default=None, help="Max samples for debugging")
@@ -284,10 +286,83 @@ def validation_step(
 ):
     """Run validation with TIC-FT buffer generation."""
     adapter_module.disable_lora()  # Inference mode
-    
-    # (Validation implementation)
-    
-    adapter_module.enable_lora()  # Back to training mode
+
+    if "future_frames" not in batch:
+        print("  ⚠️ Skipping validation batch with no future_frames")
+        adapter_module.enable_lora()
+        return None
+
+    history_frames = batch["history_frames"].to(device, dtype=dtype)
+    future_frames = batch["future_frames"].to(device, dtype=dtype)
+    B, T_hist, C, H, W = history_frames.shape
+    T_fut = future_frames.shape[1]
+
+    # Build prompt
+    caption = batch["merged_caption"][0]
+    phase_label = batch["phase_label"][0].item() if isinstance(batch["phase_label"][0], torch.Tensor) else batch["phase_label"][0]
+    sample_type = batch["sample_type"][0]
+    prompt = build_wan_prompt(caption, phase_label, sample_type)
+
+    # Encode prompt
+    pipeline.text_encoder = pipeline.text_encoder.to(device)
+    prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+        prompt=prompt,
+        negative_prompt=(
+            "Bright tones, overexposed, static, blurred details, subtitles, "
+            "worst quality, low quality, JPEG compression residue"
+        ),
+        do_classifier_free_guidance=True,
+        num_videos_per_prompt=1,
+        max_sequence_length=512,
+        device=device,
+    )
+    prompt_embeds = prompt_embeds.to(dtype=dtype)
+    if negative_prompt_embeds is not None:
+        negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype)
+    pipeline.text_encoder = pipeline.text_encoder.to("cpu")
+    torch.cuda.empty_cache()
+
+    history_frames_01 = (history_frames * 0.5 + 0.5).clamp(0.0, 1.0)
+
+    if tic_ft_manager is not None:
+        engine = RollingWindowInferenceEngine(
+            pipeline=pipeline,
+            tic_ft_manager=tic_ft_manager,
+            device=device,
+        )
+        generated_frames = engine.generate_long_video(
+            history_frames=history_frames_01,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            total_frames=T_fut,
+            guidance_scale=7.5,
+            num_inference_steps=args.num_inference_steps,
+        )
+        generated_frames = generated_frames[:, T_hist:]
+        generated_frames = generated_frames * 2.0 - 1.0
+    else:
+        history_frames_01 = (history_frames * 0.5 + 0.5).clamp(0.0, 1.0)
+        generated_frames = pipeline(
+            video=history_frames_01,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            guidance_scale=7.5,
+            num_inference_steps=args.num_inference_steps,
+            height=args.height,
+            width=args.width,
+        ).frames
+        generated_frames = generated_frames * 2.0 - 1.0
+
+    # Compute validation metrics (MSE, PSNR)
+    T_min = min(generated_frames.shape[1], T_fut)
+    gen = generated_frames[:, :T_min]
+    gt = future_frames[:, :T_min]
+    mse = F.mse_loss(gen, gt)
+    psnr = 20 * torch.log10(2.0 / torch.sqrt(mse + 1e-8))
+    print(f"  📊 Validation: MSE={mse.item():.6f}, PSNR={psnr.item():.2f} dB")
+
+    adapter_module.enable_lora()
+    return {"mse": mse.item(), "psnr": psnr.item()}
 
 
 def main(args):
@@ -360,6 +435,26 @@ def main(args):
         )
         print(f"✓ TIC-FT buffer manager created")
     
+    # Load validation dataset if a separate manifest is provided
+    val_loader = None
+    val_tfm = None
+    if args.val_manifest and os.path.exists(args.val_manifest):
+        val_dataset = WTSDataset(
+            args.val_manifest,
+            is_train=False,
+            size=(args.height, args.width),
+            max_history_frames=5,
+            history_strategy="first_n",
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=wts_collate_fn,
+            num_workers=args.num_workers,
+        )
+        print(f"✓ Validation set loaded: {len(val_dataset)} samples")
+
     # Training loop
     os.makedirs(args.output_dir, exist_ok=True)
     global_step = 0
@@ -372,6 +467,8 @@ def main(args):
         adapter_module.enable_lora()  # Training mode
         total_loss = 0.0
         num_batches = 0
+        accum_count = 0
+        optimizer.zero_grad()
         
         for batch_idx, batch in enumerate(dataloader):
             loss = train_step(
@@ -387,32 +484,44 @@ def main(args):
             if loss is None:
                 continue
             
-            # Backward pass
+            # Scale loss for gradient accumulation
+            loss = loss / args.gradient_accumulation_steps
             loss.backward()
+            accum_count += 1
             
-            # Gradient clipping
+            total_loss += loss.item() * args.gradient_accumulation_steps
+            num_batches += 1
+            
+            if accum_count >= args.gradient_accumulation_steps:
+                # Gradient clipping
+                if args.max_grad_norm > 0:
+                    nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
+                accum_count = 0
+                
+                if global_step % args.log_every == 0:
+                    avg_loss = total_loss / num_batches
+                    print(f"Step {global_step}: loss = {avg_loss:.4f}")
+                
+                if global_step % args.save_every == 0:
+                    save_checkpoint(
+                        adapter_module,
+                        optimizer,
+                        epoch,
+                        global_step,
+                        args.output_dir,
+                    )
+        
+        # Flush remaining accumulated gradients
+        if accum_count > 0:
             if args.max_grad_norm > 0:
                 nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
-            
             optimizer.step()
             optimizer.zero_grad()
-            
-            total_loss += loss.item()
-            num_batches += 1
             global_step += 1
-            
-            if (batch_idx + 1) % args.log_every == 0:
-                avg_loss = total_loss / num_batches
-                print(f"Step {global_step}: loss = {avg_loss:.4f}")
-            
-            if (batch_idx + 1) % args.save_every == 0:
-                save_checkpoint(
-                    adapter_module,
-                    optimizer,
-                    epoch,
-                    batch_idx + 1,
-                    args.output_dir,
-                )
         
         # Save epoch checkpoint
         save_checkpoint(
@@ -424,6 +533,29 @@ def main(args):
         )
         
         print(f"\n✓ Epoch {epoch + 1} completed. Avg loss: {total_loss / max(num_batches, 1):.4f}")
+
+        # Run validation after each epoch
+        if val_loader is not None:
+            print(f"\n  Running validation on {len(val_loader)} samples...")
+            val_mse_list = []
+            val_psnr_list = []
+            for val_idx, val_batch in enumerate(val_loader):
+                val_result = validation_step(
+                    pipeline,
+                    adapter_module,
+                    tic_ft_manager,
+                    val_batch,
+                    args,
+                    device,
+                    dtype,
+                )
+                if val_result is not None:
+                    val_mse_list.append(val_result["mse"])
+                    val_psnr_list.append(val_result["psnr"])
+            if val_mse_list:
+                avg_val_mse = sum(val_mse_list) / len(val_mse_list)
+                avg_val_psnr = sum(val_psnr_list) / len(val_psnr_list)
+                print(f"  📊 Validation results: MSE={avg_val_mse:.6f}, PSNR={avg_val_psnr:.2f} dB")
     
     print("\n" + "=" * 80)
     print("✓ Training completed!")

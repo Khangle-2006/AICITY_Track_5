@@ -88,6 +88,9 @@ class WanPipelineConfig:
     use_token_pruning: bool = True
     prune_threshold: float = 0.1
     overlap_frames: int = 2
+    ransac_threshold: float = 1.0
+    motion_threshold: float = 0.05
+    flow_stride: int = 4
     negative_prompt: str = (
         "Bright tones, overexposed, static, blurred details, subtitles, "
         "worst quality, low quality, JPEG compression residue, ugly, incomplete, "
@@ -382,7 +385,12 @@ class WanSOTAPipeline:
         self.vae_scale_factor_spatial = 8
 
     def _init_aux_modules(self):
-        self.background_module = BackgroundPreservationModule(use_raft=False)
+        self.background_module = BackgroundPreservationModule(
+            use_raft=False,
+            ransac_threshold=self.config.ransac_threshold,
+            motion_threshold=self.config.motion_threshold,
+            flow_stride=self.config.flow_stride,
+        )
         self.compositor = ForegroundBackgroundCompositor(
             use_depth_aware=False,
             motion_mask_weight=0.5,
@@ -431,13 +439,59 @@ class WanSOTAPipeline:
             prompts = self.build_prompts(captions, phase_labels, sample_types)
             prompt_str = prompt or prompts[0]
 
-        result = self._generate_chunk(
-            history_frames, prompt_str, target_frames, 0,
+        B, T_hist, C, H, W = history_frames.shape
+        chunk_size = self.config.chunk_size
+        overlap_frames = self.config.overlap_frames
+
+        # Initialize final output tensor
+        final_frames = torch.zeros(B, target_frames, C, H, W, dtype=history_frames.dtype, device=self.device)
+
+        # Generate first chunk
+        C_1 = min(target_frames, chunk_size)
+        chunk_1 = self._generate_chunk(
+            history_frames, prompt_str, C_1, 0,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
         )
+        n_1 = chunk_1.shape[1]
+        final_frames[:, :n_1] = chunk_1
+        L = n_1
+        chunk_idx = 1
 
-        return result
+        # Generate subsequent chunks autoregressively
+        while L < target_frames:
+            # Overlap window size
+            O = min(overlap_frames, L)
+            t_start = L - O
+            C_k = min(target_frames - t_start, chunk_size)
+
+            # Retrieve history window ending at t_start
+            temp_seq = torch.cat([history_frames, final_frames[:, :L]], dim=1)
+            curr_history = temp_seq[:, t_start : t_start + T_hist]
+
+            # Generate chunk k
+            chunk_k = self._generate_chunk(
+                curr_history, prompt_str, C_k, chunk_idx,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+            )
+            n_k = chunk_k.shape[1]
+
+            # Apply linear alpha blending on the overlap region
+            O_eff = min(O, n_k)
+            n_write = min(n_k, target_frames - t_start)
+            if O_eff > 0 and n_write > O_eff:
+                alpha = torch.linspace(0.0, 1.0, steps=O_eff, device=self.device).view(1, O_eff, 1, 1, 1).to(history_frames.dtype)
+                blend = final_frames[:, t_start : t_start + O_eff] * (1.0 - alpha) + chunk_k[:, :O_eff] * alpha
+                final_frames[:, t_start : t_start + O_eff] = blend
+                final_frames[:, t_start + O_eff : t_start + n_write] = chunk_k[:, O_eff : n_write]
+            elif n_write > 0:
+                final_frames[:, t_start : t_start + n_write] = chunk_k[:, :n_write]
+
+            L = t_start + n_write
+            chunk_idx += 1
+
+        return final_frames
 
     @torch.no_grad()
     def _generate_chunk(
@@ -451,15 +505,21 @@ class WanSOTAPipeline:
     ) -> torch.Tensor:
         B, T_hist, C, H, W = history_frames.shape
 
+        # Pad num_frames to avoid VAE temporal truncation:
+        # VAE temporal factor is 4, so (T_hist + num_frames_pad - 1) must be divisible by 4
+        vae_temp_factor = 4
+        pad_extra = (vae_temp_factor - (T_hist + num_frames - 1) % vae_temp_factor) % vae_temp_factor
+        num_frames_pad = num_frames + pad_extra
+
         if self.config.use_background_preservation:
             # Generate the future background for the entire target duration
-            background, _ = self.background_module(history_frames, num_frames)
+            background, _ = self.background_module(history_frames, num_frames_pad)
             # Concatenate history frames and warped background to guide the video-to-video pipeline
             frames_input = torch.cat([history_frames, background], dim=1)
         else:
             # Fallback: simple repetition of the last history frame
             last_frame = history_frames[:, -1:]
-            rep_frames = last_frame.repeat(1, num_frames, 1, 1, 1)
+            rep_frames = last_frame.repeat(1, num_frames_pad, 1, 1, 1)
             frames_input = torch.cat([history_frames, rep_frames], dim=1)
 
         vid_tensor = self._prepare_video_for_wan(frames_input)
@@ -497,9 +557,10 @@ class WanSOTAPipeline:
                 use_dynamic_cfg=self.config.use_dynamic_cfg,
             )[0]
 
-        # The output length matches vid_tensor, which is T_hist + num_frames.
-        # We slice off the history frames to only get the generated future frames.
-        future_generated = output[:, T_hist:]
+        # Slice off history frames and handle VAE temporal truncation
+        avail_future = output.shape[1] - T_hist
+        actual_n = min(num_frames, avail_future)
+        future_generated = output[:, T_hist:T_hist + actual_n]
 
         # Map to [-1, 1] range
         chunk_frames = future_generated * 2.0 - 1.0
