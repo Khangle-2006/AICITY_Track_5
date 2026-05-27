@@ -384,6 +384,23 @@ def infer(args):
             frame_pil = torchvision.transforms.ToPILImage()(torch.from_numpy(frame_uint8).permute(2, 0, 1))
             frame_path = os.path.join(output_subdir, f"{t:04d}.png")
             frame_pil.save(frame_path)
+            
+        # Save ground truth frames if present in batch for evaluation
+        if "future_frames" in batch:
+            gt_frames = denormalize_image(batch["future_frames"])[0]  # [T_fut, C, H, W]
+            gt_resized = resize_for_submission(
+                gt_frames.unsqueeze(0), 
+                args.output_height, 
+                args.output_width
+            )[0]
+            gt_dir = os.path.join(args.output_dir, f"{scenario_name}_gt")
+            os.makedirs(gt_dir, exist_ok=True)
+            for t in range(gt_resized.size(0)):
+                frame = gt_resized[t]
+                frame_uint8 = (frame * 255).clamp(0, 255).byte().permute(1, 2, 0).cpu().numpy()
+                frame_pil = torchvision.transforms.ToPILImage()(torch.from_numpy(frame_uint8).permute(2, 0, 1))
+                frame_path = os.path.join(gt_dir, f"{t:04d}.png")
+                frame_pil.save(frame_path)
         
         elapsed = chunk_time
         print(f"   ✓ Generated {T} frames in {elapsed:.1f}s ({T/elapsed:.1f} fps)")
