@@ -50,18 +50,25 @@ def select_frame_paths(paths, max_frames=None, strategy="tail"):
 
 class WTSDataset(Dataset):
     def __init__(self, manifest_path, is_train=True, size=(288, 512),
-                 max_history_frames=None, history_strategy="tail"):
+                 max_history_frames=None, history_strategy="tail",
+                 use_window_shift=False, history_len=None, future_len=None):
         """
         manifest_path: Path to train.jsonl, val.jsonl, or test.jsonl.
         is_train: Boolean to toggle training transforms.
         size: Target (height, width) for frames.
         max_history_frames: Optional cap for variable-K conditioning.
         history_strategy: tail, dense_tail, or uniform.
+        use_window_shift: Whether to randomly shift the history/future boundary during training.
+        history_len: Target history length for shifting (defaults to len(history_frames)).
+        future_len: Target future length for shifting (defaults to len(future_frames)).
         """
         super().__init__()
         self.is_train = is_train
         self.max_history_frames = max_history_frames
         self.history_strategy = history_strategy
+        self.use_window_shift = use_window_shift
+        self.history_len = history_len
+        self.future_len = future_len
         self.samples = []
         with open(manifest_path, "r") as f:
             for line in f:
@@ -84,11 +91,35 @@ class WTSDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         scenario_name = sample.get("scenario_name", f"sample_{idx}")
-        history_paths = select_frame_paths(
-            sample["history_frames"],
-            max_frames=self.max_history_frames,
-            strategy=self.history_strategy,
-        )
+        
+        history_paths = sample["history_frames"]
+        future_paths = sample.get("future_frames", [])
+        
+        if self.is_train and self.use_window_shift and len(future_paths) > 0:
+            import random
+            all_paths = history_paths + future_paths
+            L_total = len(all_paths)
+            
+            h_len = self.history_len or self.max_history_frames or len(history_paths)
+            f_len = self.future_len or len(future_paths)
+            segment_len = h_len + f_len
+            
+            if L_total >= segment_len:
+                start_idx = random.randint(0, L_total - segment_len)
+                history_paths = all_paths[start_idx : start_idx + h_len]
+                future_paths = all_paths[start_idx + h_len : start_idx + h_len + f_len]
+            else:
+                history_paths = select_frame_paths(
+                    sample["history_frames"],
+                    max_frames=self.max_history_frames,
+                    strategy=self.history_strategy,
+                )
+        else:
+            history_paths = select_frame_paths(
+                sample["history_frames"],
+                max_frames=self.max_history_frames,
+                strategy=self.history_strategy,
+            )
 
         history_tensor = self._load_frames(history_paths)
 
@@ -107,8 +138,8 @@ class WTSDataset(Dataset):
         if "frame_length" in sample:
             res["frame_length"] = sample["frame_length"]
 
-        if "future_frames" in sample:
-            future_tensor = self._load_frames(sample["future_frames"])
+        if len(future_paths) > 0:
+            future_tensor = self._load_frames(future_paths)
             if self.is_train and torch.rand(1).item() < 0.5:
                 future_tensor = torch.flip(future_tensor, dims=[-1])
             res["future_frames"] = future_tensor

@@ -90,7 +90,7 @@ def blend_overlap(final_frames, chunk, t_start, O, n_write, device):
 
 
 def run_chunk(pipe, vid_tensor, prompt_embeds, negative_prompt_embeds,
-              config, device, history_flow_map=None, lambda_weight=0.0):
+              config, device, history_flow_map=None, lambda_weight=0.0, phase_label=None):
     """Run a single denoising chunk, returning output frames [B, T, C, H, W] in [0,1]."""
     try:
         output = pipe(
@@ -103,8 +103,11 @@ def run_chunk(pipe, vid_tensor, prompt_embeds, negative_prompt_embeds,
             use_dynamic_cfg=config.use_dynamic_cfg,
             min_guidance_scale=config.min_guidance,
             history_flow_map=history_flow_map, lambda_weight=lambda_weight,
+            phase_label=phase_label,
         )[0]
-    except Exception:
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return None
     return output
 
@@ -130,9 +133,12 @@ def save_ground_truth(batch, output_dir, scenario_name, output_height, output_wi
         torchvision.utils.save_image(gt_resized[i], os.path.join(gt_dir, f"{i}.png"))
 
 
-def cleanup_gpu(pipe):
-    pipe.transformer = pipe.transformer.to("cpu")
-    pipe.vae = pipe.vae.to("cpu")
+def cleanup_gpu(pipe, using_cpu_offload=False):
+    if not using_cpu_offload:
+        pipe.transformer = pipe.transformer.to("cpu")
+        pipe.vae = pipe.vae.to("cpu")
+        if hasattr(pipe, "transformer_2") and pipe.transformer_2 is not None:
+            pipe.transformer_2 = pipe.transformer_2.to("cpu")
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -206,6 +212,32 @@ def infer(args):
         vae.enable_tiling()
         vae.enable_slicing()
     pipe = HFP.from_pretrained(args.model_id, torch_dtype=torch.float16, vae=vae)
+    
+    print("🩹 Patching VAE encode/decode for dtype compatibility...")
+    original_vae_encode = pipe.vae.encode
+    original_vae_decode = pipe.vae.decode
+    
+    def patched_vae_encode(x, *args, **kwargs):
+        vae_dtype = next(pipe.vae.parameters()).dtype
+        vae_device = next(pipe.vae.parameters()).device
+        weight_device = pipe.vae.encoder.conv_in.weight.device
+        weight_dtype = pipe.vae.encoder.conv_in.weight.dtype
+        print(f"DEBUG VAE ENCODE: input device={x.device}, dtype={x.dtype} | VAE device={vae_device}, dtype={vae_dtype}")
+        print(f"DEBUG CONV_IN: weight device={weight_device}, dtype={weight_dtype}")
+        return original_vae_encode(x.to(dtype=vae_dtype), *args, **kwargs)
+        
+    def patched_vae_decode(z, *args, **kwargs):
+        vae_dtype = next(pipe.vae.parameters()).dtype
+        vae_device = next(pipe.vae.parameters()).device
+        weight_device = pipe.vae.decoder.conv_in.weight.device
+        weight_dtype = pipe.vae.decoder.conv_in.weight.dtype
+        print(f"DEBUG VAE DECODE: input device={z.device}, dtype={z.dtype} | VAE device={vae_device}, dtype={vae_dtype}")
+        print(f"DEBUG CONV_IN: weight device={weight_device}, dtype={weight_dtype}")
+        return original_vae_decode(z.to(dtype=vae_dtype), *args, **kwargs)
+        
+    pipe.vae.encode = patched_vae_encode
+    pipe.vae.decode = patched_vae_decode
+
     pipe.text_encoder = None
     gc.collect()
     print(f"  Pipeline loaded, TE offloaded. GPU: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
@@ -223,11 +255,18 @@ def infer(args):
             break
 
         scenario_name = batch["scenario_name"][0]
+        sample_dir = os.path.join(args.output_dir, scenario_name)
+        target_frames = int(batch.get("frame_length", [args.chunk_size])[0])
+        if os.path.exists(sample_dir) and len([f for f in os.listdir(sample_dir) if f.endswith(".png")]) >= target_frames:
+            print(f"  [SKIPPING] {scenario_name} (already generated with {target_frames} frames)")
+            save_ground_truth(batch, args.output_dir, scenario_name, args.output_height, args.output_width)
+            sample_idx += 1
+            continue
+
         history_frames = batch["history_frames"].to(device)
         phase_label = batch["phase_label"][0].to(device)
         sample_type = batch["sample_type"][0]
         caption = batch["merged_caption"][0]
-        target_frames = int(batch.get("frame_length", [args.chunk_size])[0])
         prompt = build_wan_prompt(caption, phase_label, sample_type)
 
         embed_path = os.path.join(embeds_dir, f"{scenario_name}.pt")
@@ -240,9 +279,12 @@ def infer(args):
         negative_prompt_embeds = embeds["negative_prompt_embeds"].to(device, dtype=dtype)
         del embeds
 
+        using_cpu_offload = False
         pipe.vae = pipe.vae.to(device)
         pipe.transformer = pipe.transformer.to(device)
-        print(f"  [GPU] models loaded: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
+        if hasattr(pipe, "transformer_2") and pipe.transformer_2 is not None:
+            pipe.transformer_2 = pipe.transformer_2.to("cpu")
+        print(f"  [GPU] models loaded (transformer & VAE): {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
 
         T_hist = history_frames.shape[1]
         max_chunk = min(args.chunk_size, target_frames)
@@ -279,7 +321,7 @@ def infer(args):
             vid_tensor = prepare_video_for_wan(frames_input)
 
             output = run_chunk(pipe, vid_tensor, prompt_embeds, negative_prompt_embeds,
-                               config, device, history_flow_map, args.lambda_weight)
+                               config, device, history_flow_map, args.lambda_weight, phase_label)
             if output is None:
                 print(f"  ERROR in pipe() chunk {chunk_idx}")
                 break
@@ -309,8 +351,8 @@ def infer(args):
         prompt_embeds = None
         negative_prompt_embeds = None
         output = None
-        cleanup_gpu(pipe)
-        if not args.keep_on_gpu:
+        cleanup_gpu(pipe, using_cpu_offload=using_cpu_offload)
+        if not args.keep_on_gpu and not using_cpu_offload:
             print(f"  [GPU] after cleanup: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
 
     elapsed = time.time() - start_time

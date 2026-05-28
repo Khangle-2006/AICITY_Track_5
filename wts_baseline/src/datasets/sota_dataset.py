@@ -80,12 +80,18 @@ class SOTAWTSDataset(Dataset):
         image_size=(288, 512),
         history_strategy="dense_tail",
         augment=False,
+        use_window_shift=False,
+        history_len=None,
+        future_len=None,
     ):
         self.samples = []
         self.split = split
         self.max_history_frames = max_history_frames
         self.max_future_frames = max_future_frames
         self.history_strategy = history_strategy
+        self.use_window_shift = use_window_shift
+        self.history_len = history_len
+        self.future_len = future_len
 
         with open(manifest_path, "r") as f:
             for line in f:
@@ -107,9 +113,31 @@ class SOTAWTSDataset(Dataset):
         sample = self.samples[idx]
 
         history_paths = sample["history_frames"]
-        history_paths = select_frame_paths_sota(
-            history_paths, self.max_history_frames, self.history_strategy
-        )
+        future_paths = sample.get("future_frames", [])
+
+        if self.split == "train" and self.use_window_shift and len(future_paths) > 0:
+            import random
+            all_paths = history_paths + future_paths
+            L_total = len(all_paths)
+            
+            h_len = self.history_len or self.max_history_frames or len(history_paths)
+            f_len = self.future_len or self.max_future_frames or len(future_paths)
+            segment_len = h_len + f_len
+            
+            if L_total >= segment_len:
+                start_idx = random.randint(0, L_total - segment_len)
+                history_paths = all_paths[start_idx : start_idx + h_len]
+                future_paths = all_paths[start_idx + h_len : start_idx + h_len + f_len]
+            else:
+                history_paths = select_frame_paths_sota(
+                    history_paths, self.max_history_frames, self.history_strategy
+                )
+                future_paths = future_paths[:self.max_future_frames]
+        else:
+            history_paths = select_frame_paths_sota(
+                history_paths, self.max_history_frames, self.history_strategy
+            )
+            future_paths = future_paths[:self.max_future_frames]
 
         history_frames = []
         for path in history_paths:
@@ -121,8 +149,7 @@ class SOTAWTSDataset(Dataset):
         history_tensor = torch.stack(history_frames, dim=0)
 
         future_tensor = None
-        if "future_frames" in sample and sample["future_frames"]:
-            future_paths = sample["future_frames"][:self.max_future_frames]
+        if len(future_paths) > 0:
             future_frames = []
             for path in future_paths:
                 img = Image.open(path).convert("RGB")
@@ -144,7 +171,7 @@ class SOTAWTSDataset(Dataset):
         scenario_name = sample.get("scenario_name", "")
         view_type = sample.get("view_type", "overhead")
         sample_type = infer_sample_type_sota(scenario_name, view_type)
-        frame_length = sample.get("frame_length", self.max_future_frames)
+        frame_length = sample.get("frame_length", len(future_paths) if future_paths else self.max_future_frames)
 
         result = {
             "history_frames": history_tensor,

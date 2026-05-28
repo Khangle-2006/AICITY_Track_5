@@ -85,37 +85,49 @@ def compute_fvd(
     generated and real video sets.
     """
     try:
-        from pytorch_fid.fid_score import calculate_frechet_distance
-    except ImportError:
+        from cdfvd.fvd import load_i3d_model, preprocess_i3d
+        from cdfvd.third_party.i3d.utils import frechet_distance
+
+        # Determine the target frame length (minimum frame length across all videos)
+        min_f = min([len(v) for v in generated_videos] + [len(v) for v in real_videos])
+        if min_f <= 0:
+            return 0.0
+
+        # Crop all videos to min_f frames to ensure they can be stacked
+        gen_videos_cropped = [v[:min_f] for v in generated_videos]
+        real_videos_cropped = [v[:min_f] for v in real_videos]
+
+        gen_videos_np = np.stack([np.stack(v) for v in gen_videos_cropped])  # (B, T, H, W, C)
+        real_videos_np = np.stack([np.stack(v) for v in real_videos_cropped])  # (B, T, H, W, C)
+
+        # Load pre-trained I3D model
+        i3d = load_i3d_model(device)
+
+        # Preprocess videos
+        gen_tensor = preprocess_i3d(gen_videos_np, target_resolution=(224, 224)).to(device)
+        real_tensor = preprocess_i3d(real_videos_np, target_resolution=(224, 224)).to(device)
+
+        # Interpolate temporally to 9 frames if less than 9 frames (downsampling limit of I3D)
+        if gen_tensor.shape[2] < 9:
+            import torch.nn.functional as F
+            gen_tensor = F.interpolate(gen_tensor, size=(9, 224, 224), mode='trilinear', align_corners=False)
+            real_tensor = F.interpolate(real_tensor, size=(9, 224, 224), mode='trilinear', align_corners=False)
+
+        with torch.no_grad():
+            gen_feats = i3d(gen_tensor).squeeze()
+            real_feats = i3d(real_tensor).squeeze()
+
+        # If batch size is 1, squeeze() results in 1D tensor of shape (400,).
+        # We need 2D tensor (1, 400) for covariance calculation.
+        if gen_feats.dim() == 1:
+            gen_feats = gen_feats.unsqueeze(0)
+            real_feats = real_feats.unsqueeze(0)
+
+        fvd_score = frechet_distance(gen_feats, real_feats).item()
+        return fvd_score
+    except Exception as e:
+        print(f"Failed to compute FVD using cdfvd (I3D): {e}. Falling back to simplified frame-level ResNet FVD.")
         return compute_fvd_simple(generated_videos, real_videos, feature_extractor, device)
-
-    gen_features = []
-    for video in generated_videos:
-        video_tensor = torch.stack([
-            torch.from_numpy(f).permute(2, 0, 1).float() / 255.0 for f in video
-        ]).unsqueeze(0).to(device)
-        with torch.no_grad():
-            feat = feature_extractor(video_tensor)
-        gen_features.append(feat.cpu().numpy())
-
-    real_features = []
-    for video in real_videos:
-        video_tensor = torch.stack([
-            torch.from_numpy(f).permute(2, 0, 1).float() / 255.0 for f in video
-        ]).unsqueeze(0).to(device)
-        with torch.no_grad():
-            feat = feature_extractor(video_tensor)
-        real_features.append(feat.cpu().numpy())
-
-    gen_features = np.concatenate(gen_features, axis=0)
-    real_features = np.concatenate(real_features, axis=0)
-
-    mu_gen = np.mean(gen_features, axis=0)
-    sigma_gen = np.cov(gen_features, rowvar=False)
-    mu_real = np.mean(real_features, axis=0)
-    sigma_real = np.cov(real_features, rowvar=False)
-
-    return calculate_frechet_distance(mu_gen, sigma_gen, mu_real, sigma_real)
 
 
 def compute_fvd_simple(
@@ -246,15 +258,14 @@ def evaluate_metrics(
     if use_fvd:
         feature_extractor = _get_feature_extractor(device)
 
-    captions = {}
+    manifest_entries = []
     if manifest_path and os.path.exists(manifest_path):
         with open(manifest_path, "r") as f:
             for line in f:
-                entry = json.loads(line.strip())
-                scenario = entry.get("scenario_name", "")
-                captions[scenario] = entry.get("merged_caption", "")
+                if line.strip():
+                    manifest_entries.append(json.loads(line.strip()))
 
-    for gen_dir, gt_dir in pairs:
+    for pair_idx, (gen_dir, gt_dir) in enumerate(pairs):
         sample_name = gen_dir.name
 
         gen_frames = load_frames(gen_dir)
@@ -295,7 +306,23 @@ def evaluate_metrics(
             results["lpips"].append(sample_metrics["lpips"])
 
         if use_clip and clip_model is not None:
-            caption = captions.get(sample_name, "")
+            # Find the correct manifest entry for this sample
+            entry = None
+            for e in manifest_entries:
+                if e.get("scenario_name") == sample_name:
+                    entry = e
+                    break
+            if entry is None and sample_name.startswith("sample_"):
+                try:
+                    idx = int(sample_name.split("_")[1])
+                    if idx < len(manifest_entries):
+                        entry = manifest_entries[idx]
+                except Exception:
+                    pass
+            if entry is None and pair_idx < len(manifest_entries):
+                entry = manifest_entries[pair_idx]
+
+            caption = entry.get("merged_caption", "") if entry is not None else ""
             if caption:
                 clip_score = compute_clip_score(gen_frames, caption, clip_model, clip_processor, device)
                 sample_metrics["clip_s"] = clip_score
@@ -324,18 +351,25 @@ def evaluate_metrics(
         if scores:
             averages[metric] = float(np.mean(scores))
 
-    if results.get("psnr") and results.get("ssim") and results.get("lpips") and results.get("clip_s"):
-        fvd_norm = 0
-        if results.get("fvd"):
-            fvd_norm = min(results["fvd"][0] / 1000, 1.0)
+    # Calculate weighted average metric score robustly
+    fvd_norm = 0.0
+    if results.get("fvd"):
+        fvd_norm = min(results["fvd"][0] / 1000.0, 1.0)
 
-        averages["average"] = (
-            averages.get("psnr", 0) / 50 +
-            averages.get("ssim", 0) +
-            (1 - averages.get("lpips", 1)) +
-            averages.get("clip_s", 0) / 0.3 +
-            (1 - fvd_norm)
-        ) / 5
+    scores_to_avg = []
+    if averages.get("psnr"):
+        scores_to_avg.append(averages["psnr"] / 50.0)
+    if averages.get("ssim"):
+        scores_to_avg.append(averages["ssim"])
+    if averages.get("lpips") is not None:
+        scores_to_avg.append(1.0 - averages["lpips"])
+    if averages.get("clip_s"):
+        scores_to_avg.append(averages["clip_s"] / 0.3)
+    if results.get("fvd"):
+        scores_to_avg.append(1.0 - fvd_norm)
+
+    if scores_to_avg:
+        averages["average"] = sum(scores_to_avg) / len(scores_to_avg)
 
     output_file = os.path.join(output_dir, "eval_results_sota.json")
     with open(output_file, "w") as f:

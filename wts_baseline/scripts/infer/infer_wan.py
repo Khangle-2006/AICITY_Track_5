@@ -120,7 +120,7 @@ def main():
     # Sampling
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=5.0)
-    parser.add_argument("--min_guidance", type=float, default=1.0)
+    parser.add_argument("--min_guidance", type=float, default=1.5)
     parser.add_argument("--strength", type=float, default=0.7)
     parser.add_argument("--flow_shift", type=float, default=3.0)
     parser.add_argument("--max_sequence_length", type=int, default=512)

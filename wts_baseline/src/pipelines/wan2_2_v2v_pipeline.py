@@ -16,8 +16,28 @@ from diffusers.pipelines.wan.pipeline_output import WanPipelineOutput
 
 class Wan2_2V2VPipeline(HFWanPipeline):
     """
-    Subclass of HF WanVideoToVideoPipeline with Inference-time Latent Flow Guidance.
+    Subclass of HF WanVideoToVideoPipeline with Inference-time Latent Flow Guidance and Semantic Expert Routing.
     """
+
+    _optional_components = ["transformer", "transformer_2"]
+
+    def __init__(
+        self,
+        tokenizer,
+        text_encoder,
+        transformer,
+        vae,
+        scheduler,
+        transformer_2=None,
+    ):
+        super().__init__(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            transformer=transformer,
+            vae=vae,
+            scheduler=scheduler,
+        )
+        self.register_modules(transformer_2=transformer_2)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -93,6 +113,8 @@ class Wan2_2V2VPipeline(HFWanPipeline):
         use_dynamic_cfg=True,
         history_flow_map=None,
         lambda_weight=0.1,
+        phase_label=None,
+        guidance_scale_2=None,
     ):
         height = height or self.transformer.config.sample_height * self.vae_scale_factor_spatial
         width = width or self.transformer.config.sample_width * self.vae_scale_factor_spatial
@@ -160,7 +182,35 @@ class Wan2_2V2VPipeline(HFWanPipeline):
             latent_timestep,
         )
 
+        if guidance_scale_2 is None:
+            guidance_scale_2 = guidance_scale
+
+        boundary_timestep = None
+        if hasattr(self, "transformer_2") and self.transformer_2 is not None:
+            boundary_ratio = 0.875
+            if phase_label is not None:
+                p_val = int(phase_label) if not isinstance(phase_label, torch.Tensor) else int(phase_label.item())
+                if p_val in [0, 1]:
+                    boundary_ratio = 0.50
+                elif p_val in [3, 4]:
+                    boundary_ratio = 0.95
+                elif p_val == 2:
+                    boundary_ratio = 0.875
+            else:
+                boundary_ratio = getattr(self.config, "boundary_ratio", 0.875)
+                if boundary_ratio is None:
+                    boundary_ratio = 0.875
+
+            num_train_timesteps = getattr(self.scheduler.config, "num_train_timesteps", 1000)
+            boundary_timestep = boundary_ratio * num_train_timesteps
+
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        def is_on_gpu(module):
+            try:
+                return next(module.parameters()).device.type == "cuda"
+            except StopIteration:
+                return False
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -177,27 +227,59 @@ class Wan2_2V2VPipeline(HFWanPipeline):
                         step_guidance_scale = min_guidance_scale + (guidance_scale - min_guidance_scale) * (
                             0.5 * (1.0 + math.cos(math.pi * progress))
                         )
+                        step_guidance_scale_2 = min_guidance_scale + (guidance_scale_2 - min_guidance_scale) * (
+                            0.5 * (1.0 + math.cos(math.pi * progress))
+                        )
                     else:
                         step_guidance_scale = guidance_scale
+                        step_guidance_scale_2 = guidance_scale_2
 
                 t_val = t.item() if isinstance(t, torch.Tensor) else float(t)
 
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-                if self.do_classifier_free_guidance:
-                    noise_uncond = self.transformer(
+                # Determine which expert to run and hot-swap if necessary
+                use_transformer_2 = False
+                if boundary_timestep is not None and hasattr(self, "transformer_2") and self.transformer_2 is not None:
+                    if t_val < boundary_timestep:
+                        use_transformer_2 = True
+
+                if use_transformer_2:
+                    if not is_on_gpu(self.transformer_2):
+                        print(f"🔄 Hot-swapping at t={t_val:.1f}: Moving transformer to CPU and transformer_2 to {device}...")
+                        self.transformer = self.transformer.to("cpu")
+                        torch.cuda.empty_cache()
+                        self.transformer_2 = self.transformer_2.to(device)
+                    active_transformer = self.transformer_2
+                    active_guidance_scale = step_guidance_scale_2 if self.do_classifier_free_guidance else guidance_scale_2
+                else:
+                    if not is_on_gpu(self.transformer):
+                        print(f"🔄 Hot-swapping at t={t_val:.1f}: Moving transformer_2 to CPU and transformer to {device}...")
+                        if hasattr(self, "transformer_2") and self.transformer_2 is not None:
+                            self.transformer_2 = self.transformer_2.to("cpu")
+                        torch.cuda.empty_cache()
+                        self.transformer = self.transformer.to(device)
+                    active_transformer = self.transformer
+                    active_guidance_scale = step_guidance_scale if self.do_classifier_free_guidance else guidance_scale
+
+                # Compute active expert prediction
+                with active_transformer.cache_context("cond") if hasattr(active_transformer, "cache_context") else torch.no_grad():
+                    noise_pred = active_transformer(
                         hidden_states=latent_model_input,
                         timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                     )[0]
-                    noise_pred = noise_uncond + step_guidance_scale * (noise_pred - noise_uncond)
+
+                if self.do_classifier_free_guidance:
+                    with active_transformer.cache_context("uncond") if hasattr(active_transformer, "cache_context") else torch.no_grad():
+                        noise_uncond = active_transformer(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                    noise_pred = noise_uncond + active_guidance_scale * (noise_pred - noise_uncond)
 
                 if history_flow_map is not None and lambda_weight > 0.0:
                     sigma = t_val / 1000.0

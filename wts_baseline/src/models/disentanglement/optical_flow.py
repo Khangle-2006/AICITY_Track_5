@@ -142,50 +142,64 @@ def estimate_homography_ransac(
     return torch.from_numpy(np.stack(homographies)).to(flow.device).float()
 
 
-def compute_motion_mask(
-    flow: torch.Tensor,
+def compute_motion_mask_from_warp(
+    frame_src: torch.Tensor,
+    frame_dst: torch.Tensor,
     homography: torch.Tensor,
-    threshold: float = 5.0,
+    diff_threshold: float = 0.1,
 ) -> torch.Tensor:
     """
-    Compute binary motion mask by finding flow outliers from homography.
+    Compute binary motion mask by warping frame_src to frame_dst's viewpoint
+    and thresholding pixel-wise differences.
 
-    Pixels where flow deviates significantly from the homography prediction
-    are classified as dynamic foreground.
+    This is more reliable than optical-flow-based motion detection because:
+      - It amplifies slow motion via the temporal gap between src and dst
+      - It directly measures "does this pixel belong to the static background?"
+      - Farneback flow is unreliable for small objects at 480p
 
     Args:
-        flow: [B, 2, H, W] - optical flow
-        homography: [B, 3, 3] - homography matrix
-        threshold: deviation threshold for motion classification
+        frame_src: [B, C, H, W] - earlier frame (to be warped)
+        frame_dst: [B, C, H, W] - later frame (reference)
+        homography: [B, 3, 3] - homography aligning src to dst
+        diff_threshold: normalized pixel difference threshold [0, 1]
 
     Returns:
         mask: [B, 1, H, W] - motion mask (1 = dynamic, 0 = static)
     """
-    B, _, H, W = flow.shape
+    B, C, H, W = frame_src.shape
+
+    # Build identity grid
+    y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    dst_pts = np.stack([x_coords, y_coords, np.ones_like(x_coords)], axis=-1)
+    dst_pts_flat = dst_pts.reshape(-1, 3).T  # [3, H*W]
+
     masks = []
-
     for b in range(B):
-        H_mat = homography[b].cpu().numpy()
+        H_inv = np.linalg.inv(homography[b].cpu().numpy())
 
-        y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-        pts = np.stack([x_coords, y_coords, np.ones_like(x_coords)], axis=-1)
-        pts = pts.reshape(-1, 3).T
+        # Map each dst pixel back to src
+        src_pts = H_inv @ dst_pts_flat
+        src_pts = src_pts[:2] / src_pts[2:3]  # [2, H*W]
 
-        pts_warped = H_mat @ pts
-        pts_warped = pts_warped[:2] / pts_warped[2:3]
+        src_x = 2.0 * src_pts[0].reshape(H, W) / (W - 1) - 1.0
+        src_y = 2.0 * src_pts[1].reshape(H, W) / (H - 1) - 1.0
 
-        pts_warped = pts_warped.T.reshape(H, W, 2)
-        pts_orig = np.stack([x_coords, y_coords], axis=-1)
+        grid = torch.from_numpy(np.stack([src_x, src_y], axis=-1)).to(frame_src.device).float()
+        grid = grid.unsqueeze(0)  # [1, H, W, 2]
 
-        flow_homography = pts_warped - pts_orig
-        flow_actual = flow[b].permute(1, 2, 0).cpu().numpy()
+        # Warp frame_src to dst viewpoint
+        warped_src = F.grid_sample(
+            frame_src[b:b+1], grid, mode="bilinear",
+            padding_mode="zeros", align_corners=True,
+        )  # [1, C, H, W]
 
-        deviation = np.linalg.norm(flow_actual - flow_homography, axis=-1)
-        mask = (deviation > threshold).astype(np.float32)
+        # Pixel-wise difference (normalized in [0, 1] space)
+        diff = (warped_src - frame_dst[b:b+1]).abs().mean(dim=1, keepdim=True)  # [1, 1, H, W]
+        mask = (diff > diff_threshold).float()
 
-        masks.append(torch.from_numpy(mask).to(flow.device))
+        masks.append(mask.squeeze(0))
 
-    return torch.stack(masks, dim=0).unsqueeze(1)
+    return torch.stack(masks, dim=0)
 
 
 def warp_background(
@@ -254,14 +268,16 @@ class OpticalFlowDisentanglement(nn.Module):
         self,
         use_raft: bool = False,
         raft_model_path: Optional[str] = None,
-        ransac_threshold: float = 3.0,
-        motion_threshold: float = 5.0,
+        ransac_threshold: float = 1.0,
+        motion_threshold: float = 0.05,
+        flow_stride: int = 4,
     ):
         super().__init__()
         self.use_raft = use_raft
         self.raft_model_path = raft_model_path
         self.ransac_threshold = ransac_threshold
         self.motion_threshold = motion_threshold
+        self.flow_stride = flow_stride
 
     def forward(
         self,
@@ -270,6 +286,11 @@ class OpticalFlowDisentanglement(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Process history frames to extract background motion model.
+
+        Motion detection uses frame-differencing with homography warp
+        (frame[0] vs frame[-1]) instead of optical-flow thresholding.
+        This amplifies small motion signals by ~15x and is far more
+        reliable for detecting slow pedestrians at 480p resolution.
 
         Args:
             history_frames: [B, T, C, H, W] - history video frames
@@ -281,10 +302,12 @@ class OpticalFlowDisentanglement(nn.Module):
         """
         B, T, C, H, W = history_frames.shape
 
+        # Use stride-based flow pairs for robust homography estimation
         flows = []
-        for t in range(T - 1):
+        for t in range(0, T - 1, self.flow_stride):
+            end = min(t + self.flow_stride, T - 1)
             frame1 = history_frames[:, t]
-            frame2 = history_frames[:, t + 1]
+            frame2 = history_frames[:, end]
 
             if self.use_raft:
                 flow = compute_optical_flow_raft(frame1, frame2, self.raft_model_path)
@@ -293,10 +316,20 @@ class OpticalFlowDisentanglement(nn.Module):
 
             flows.append(flow)
 
+        if len(flows) == 0:
+            flows.append(torch.zeros(B, 2, H, W, device=history_frames.device))
+
         avg_flow = torch.stack(flows, dim=0).mean(dim=0)
 
         homography = estimate_homography_ransac(avg_flow, self.ransac_threshold)
-        motion_mask = compute_motion_mask(avg_flow, homography, self.motion_threshold)
+
+        # Use frame-differencing with warp for motion mask (amplifies slow motion ~15x)
+        frame_first = history_frames[:, 0]
+        frame_last = history_frames[:, -1]
+        motion_mask = compute_motion_mask_from_warp(
+            frame_first, frame_last, homography,
+            diff_threshold=self.motion_threshold,
+        )
 
         return homography, motion_mask, avg_flow
 
@@ -330,6 +363,8 @@ class OpticalFlowDisentanglement(nn.Module):
             warped = warp_background(last_history_frame, current_homography)
             background_frames.append(warped)
 
+        if not background_frames:
+            return last_history_frame.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
         return torch.stack(background_frames, dim=1)
 
 
@@ -345,11 +380,17 @@ class BackgroundPreservationModule(nn.Module):
         self,
         use_raft: bool = False,
         raft_model_path: Optional[str] = None,
+        ransac_threshold: float = 1.0,
+        motion_threshold: float = 0.05,
+        flow_stride: int = 4,
     ):
         super().__init__()
         self.flow_module = OpticalFlowDisentanglement(
             use_raft=use_raft,
             raft_model_path=raft_model_path,
+            ransac_threshold=ransac_threshold,
+            motion_threshold=motion_threshold,
+            flow_stride=flow_stride,
         )
 
     def forward(

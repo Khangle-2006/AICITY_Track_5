@@ -19,3 +19,6 @@ Danh_Tien_workspace/
 **/checkpoints*/
 **/prediction*/
 **/logs*/
+*.log
+wts_baseline/scratch/
+

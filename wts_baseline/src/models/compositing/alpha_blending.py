@@ -100,6 +100,19 @@ class AdaptiveAlphaBlending(nn.Module):
                 depth_threshold=depth_threshold,
             )
 
+    def _get_gaussian_kernel(
+        self,
+        kernel_size: int = 5,
+        sigma: float = 1.5,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Generates a 2D Gaussian kernel."""
+        coords = torch.arange(kernel_size, dtype=torch.float32, device=device) - (kernel_size - 1) / 2.0
+        g = torch.exp(-coords**2 / (2.0 * sigma**2))
+        g = g / g.sum()
+        g2d = torch.outer(g, g)
+        return g2d.unsqueeze(0).unsqueeze(0)  # [1, 1, kernel_size, kernel_size]
+
     def forward(
         self,
         foreground: torch.Tensor,
@@ -136,11 +149,11 @@ class AdaptiveAlphaBlending(nn.Module):
             # Reshape to 2D for spatial morphological dilation and smoothing
             motion_mask_2d = motion_mask.permute(0, 2, 1, 3, 4).reshape(B_m * T_m, C_m, H_m, W_m)
             
-            # Dilation with kernel_size=5 (padding=2) to expand foreground coverage
-            dilated = F.max_pool2d(motion_mask_2d, kernel_size=5, stride=1, padding=2)
+            # Dilation with kernel_size=3 (padding=1) to slightly expand foreground coverage
+            dilated = F.max_pool2d(motion_mask_2d, kernel_size=3, stride=1, padding=1)
             
-            # Smoothing with box filter to feather edges
-            kernel = torch.ones(1, 1, 5, 5, device=motion_mask.device) / 25.0
+            # Smoothing with Gaussian filter to feather edges
+            kernel = self._get_gaussian_kernel(kernel_size=5, sigma=1.5, device=motion_mask.device)
             feathered = F.conv2d(dilated, kernel, padding=2)
             
             # Reshape back to 5D
