@@ -1,0 +1,121 @@
+# ===========================================================================
+# configs/lora_finetune.yaml
+# LoRA fine-tuning config for traffic domain adaptation of Wan2.2 I2V
+# ===========================================================================
+# 
+# Strategy:
+# - Fine-tune only LoRA adapters (rank 64) on WTS + BDD_PC_5K training data
+# - Freeze base Wan2.2 weights → minimal GPU memory (~24GB per GPU)
+# - Train ~1000 steps with cosine LR schedule
+# - Export LoRA safetensors for inference
+#
+# Hardware: 2× A100 80GB recommended; 1× A100 possible with gradient checkpointing
+# ===========================================================================
+
+model:
+  repo_id: "Wan-AI/Wan2.2-I2V-A14B"
+  local_dir: "./checkpoints/Wan2.2-I2V-A14B"
+  dtype: "bfloat16"
+  device: "cuda"
+  # Enable gradient checkpointing to fit on 1 GPU
+  gradient_checkpointing: true
+
+# ---------------------------------------------------------------------------
+# LoRA Configuration (PEFT)
+# ---------------------------------------------------------------------------
+lora:
+  # Rank determines capacity of adapter. Higher = more expressive but slower.
+  # rank=64 is a good balance for domain adaptation.
+  rank: 64
+  lora_alpha: 64             # alpha = rank → scale factor = 1.0
+  lora_dropout: 0.05
+  # Target modules: DiT attention layers (query, key, value, output projections)
+  # Wan2.2 uses "to_q", "to_k", "to_v", "to_out.0" naming convention
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"       # Also adapt feedforward for better domain alignment
+    - "ff.net.2"
+  bias: "none"
+  use_rslora: true           # RS-LoRA: scaled rank stabilization (recommended)
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  # Dataset paths
+  wts_data_dir: "./data/wts/train"
+  bdd_data_dir: "./data/bdd_pc_5k"
+  
+  # Training parameters
+  num_epochs: 3
+  max_steps: 2000            # Override epochs if set
+  batch_size: 1              # Per GPU; use gradient accumulation for effective BS
+  gradient_accumulation_steps: 4   # Effective batch size = 4
+  
+  # Learning rate
+  learning_rate: 1.0e-4
+  lr_scheduler: "cosine"
+  warmup_steps: 100
+  min_lr_ratio: 0.1          # Cosine decay floor
+  
+  # Optimizer
+  optimizer: "adamw"
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  
+  # Frame sampling for training
+  num_frames: 33             # Same as inference
+  frame_stride: 1
+  # During training: randomly sample N frames from each video
+  # History: first K frames; Target: next N-K frames
+  num_history_frames: 8      # Number of frames used as conditioning
+  
+  # Resolution: resize to 720p during training for speed
+  train_resolution: [720, 1280]
+  
+  # Loss function
+  # Standard flow-matching loss (Wan2.2 uses flow matching, not DDPM)
+  loss_type: "flow_matching"
+  
+  # Data augmentation
+  augmentation:
+    random_flip: false       # NO horizontal flip for traffic (directionality matters)
+    color_jitter: true
+    jitter_brightness: 0.1
+    jitter_contrast: 0.1
+    jitter_saturation: 0.05
+  
+  # Checkpointing
+  save_every_n_steps: 500
+  save_dir: "./checkpoints/lora"
+  
+  # Validation
+  val_every_n_steps: 250
+  val_batch_size: 1
+  num_val_samples: 16
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  use_wandb: true
+  project: "wts2026_lora_finetune"
+  run_name: "wan2_i2v_traffic_lora_r64"
+  log_every_n_steps: 50
+
+# ---------------------------------------------------------------------------
+# Distributed Training (DeepSpeed / FSDP)
+# ---------------------------------------------------------------------------
+distributed:
+  # Use DeepSpeed ZeRO-2 for multi-GPU training
+  backend: "deepspeed"
+  zero_stage: 2
+  # Or use FSDP:
+  # backend: "fsdp"
+  # fsdp_sharding_strategy: "FULL_SHARD"

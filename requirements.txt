@@ -1,0 +1,100 @@
+# ===========================================================================
+# Requirements: WTS 2026 Traffic Video Forecasting Pipeline
+# ===========================================================================
+# Core: Python >= 3.10, CUDA >= 12.1, GPU >= 40GB VRAM (A100 recommended)
+# 
+# Install order matters for flash_attn:
+#   1. Install torch first
+#   2. Install everything else
+#   3. Install flash_attn last
+# ===========================================================================
+
+# ---------- PyTorch (CUDA 12.1) ----------
+torch>=2.4.0
+torchvision>=0.19.0
+torchaudio>=2.4.0
+
+# ---------- Diffusers ecosystem ----------
+# Wan2.2 is integrated into Diffusers >= 0.32.0
+# Paper: Wan2.2 (Wan-Video/Wan2.2) – backbone I2V model
+diffusers>=0.33.0
+transformers>=4.47.0
+accelerate>=1.2.0
+peft>=0.13.0          # LoRA fine-tuning (PEFT library)
+safetensors>=0.4.5
+
+# ---------- CacheDiT (vipshop/cache-dit) ----------
+# Paper: CacheDiT – 2-9× inference speedup via hybrid cache (DBCache, TaylorSeer, SCM)
+# Repo: https://github.com/vipshop/cache-dit
+cache-dit>=0.4.0
+
+# ---------- TeaCache (ali-vilab/TeaCache) ----------
+# Paper: arXiv 2411.19108 – Timestep Embedding Aware Cache, 4.41× speedup
+# Integrated directly via hook injection (no separate package needed)
+# Reference: https://github.com/ali-vilab/TeaCache
+
+# ---------- V-JEPA 2.1 (Meta) ----------
+# Paper: arXiv 2603.14482 – Dense video self-supervised features
+# Used for: perceptual candidate selection, physics token injection
+# Access via HuggingFace
+# Model: facebook/vjepa2-vitl-fpc16-256 or similar
+
+# ---------- Video/Image processing ----------
+opencv-python>=4.10.0
+Pillow>=10.4.0
+imageio>=2.35.0
+imageio-ffmpeg>=0.5.1
+decord>=0.6.0           # Fast video decoding (used in dataset)
+av>=12.3.0              # PyAV for video I/O
+
+# ---------- Metrics ----------
+# PSNR, SSIM: skimage
+scikit-image>=0.24.0
+# LPIPS: perceptual loss
+lpips>=0.1.4
+# CLIP-S: CLIP similarity score
+open-clip-torch>=2.26.1
+# FVD: Fréchet Video Distance (uses I3D features)
+# pytorch-fid is for FID; FVD needs custom I3D
+# We use a lightweight I3D feature extractor from:
+# https://github.com/piergiaj/pytorch-i3d (manual install or pip below)
+torchmetrics>=1.4.0     # FVD via torchmetrics.image.fid or video
+
+# ---------- Optical flow (for motion estimation) ----------
+# Used in: frame history analysis, motion-guided generation
+# torchvision RAFT is included with torchvision>=0.17
+
+# ---------- Numerical & utilities ----------
+numpy>=1.26.0
+scipy>=1.13.0
+einops>=0.8.0
+tqdm>=4.66.0
+rich>=13.7.0
+
+# ---------- LLM / prompt enhancement (CoECT) ----------
+# Paper: arXiv 2603.09094 – CoECT causal event decomposition
+# Uses Anthropic API for causal reasoning
+anthropic>=0.34.0
+openai>=1.40.0         # Alternative LLM backend
+
+# ---------- Configuration & serialization ----------
+omegaconf>=2.3.0
+hydra-core>=1.3.2
+pyyaml>=6.0.2
+
+# ---------- Logging & experiment tracking ----------
+wandb>=0.18.0
+tensorboard>=2.17.0
+
+# ---------- HuggingFace Hub ----------
+huggingface-hub>=0.26.0
+datasets>=3.1.0
+
+# ---------- Flash Attention (install LAST) ----------
+# Required by Wan2.2 for efficient attention
+# Installation: pip install flash-attn --no-build-isolation
+# (build from source if pip wheel not available for your CUDA)
+# flash-attn>=2.6.3   # <-- uncomment and install manually last
+
+# ---------- Optional: Multi-GPU ----------
+xformers>=0.0.28        # Memory-efficient attention alternative to flash-attn

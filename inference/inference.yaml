@@ -1,0 +1,170 @@
+# ===========================================================================
+# configs/inference.yaml
+# Main inference configuration for WTS 2026 Challenge – Track 5
+# ===========================================================================
+# 
+# Usage:
+#   python run_inference.py --config configs/inference.yaml
+#
+# All parameters here can be overridden from the command line via Hydra:
+#   python run_inference.py model.num_frames=33 ensemble.n_candidates=8
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Model: Wan2.2 I2V A14B
+# Paper: Wan2.2 (Wan-Video/Wan2.2) – MoE 27B total, 14B active per step
+# HuggingFace: Wan-AI/Wan2.2-I2V-A14B
+# ---------------------------------------------------------------------------
+model:
+  repo_id: "Wan-AI/Wan2.2-I2V-A14B"
+  local_dir: "./checkpoints/Wan2.2-I2V-A14B"
+  dtype: "bfloat16"          # bf16 for A100/H100; use float16 for older GPUs
+  device: "cuda"
+  
+  # Generation hyperparams (Wan2.2 I2V defaults)
+  num_frames: 33             # Number of frames to generate (adjustable per test case)
+  fps: 16                    # Frames per second (matches WTS annotation timing)
+  guidance_scale: 5.0        # Classifier-free guidance scale
+  num_inference_steps: 50    # Denoising steps (reduced by TeaCache/CacheDiT)
+  seed: 42                   # Base seed (varied per ensemble candidate)
+  
+  # Resolution: follows aspect ratio of input history frames
+  # size is set dynamically based on input frame resolution
+  # Default WTS overhead camera: typically 1920×1080 or 1280×720
+  max_area: 720 * 1280       # Cap generation area for memory efficiency
+
+# ---------------------------------------------------------------------------
+# LoRA fine-tuned weights (optional but improves traffic-domain alignment)
+# ---------------------------------------------------------------------------
+lora:
+  enabled: true
+  weights_path: "./checkpoints/lora/traffic_lora.safetensors"
+  alpha: 1.0                 # LoRA scale (1.0 = full LoRA effect)
+
+# ---------------------------------------------------------------------------
+# Prompt Relay – Temporal Control
+# Paper: arXiv 2604.10030 – Inference-Time Temporal Control for Multi-Event
+# Video Generation (integrated into Wan2.2)
+# ---------------------------------------------------------------------------
+prompt_relay:
+  enabled: true
+  # sigma: decay parameter controlling boundary sharpness
+  # Lower sigma = harder boundary; higher = smoother transition
+  sigma: 0.2
+  # Temporal split: first half pedestrian, second half vehicle by default
+  # (overridden by CoECT when event phases have explicit timing)
+  default_split: 0.5
+
+# ---------------------------------------------------------------------------
+# CoECT – Causal Event Decomposition
+# Paper: arXiv 2603.09094 – Chain of Event-Centric Causal Thought
+# Decomposes traffic captions into elementary events with causal constraints
+# ---------------------------------------------------------------------------
+coect:
+  enabled: true
+  llm_backend: "anthropic"   # "anthropic" | "openai" | "local"
+  llm_model: "claude-sonnet-4-6"  # LLM used for causal reasoning
+  # How many elementary events to decompose each scenario into
+  max_events: 5
+  # Whether to generate intermediate keyframe descriptions
+  generate_keyframes: true
+  # Physics constraint templates for traffic scenarios
+  use_traffic_physics: true
+
+# ---------------------------------------------------------------------------
+# Caption Enhancement
+# LLM-based enrichment of raw WTS captions for better video alignment
+# ---------------------------------------------------------------------------
+caption_enhancer:
+  enabled: true
+  # Prepend context about camera viewpoint (overhead), scene type, etc.
+  add_viewpoint_context: true
+  # Combine pedestrian + vehicle captions into global context prompt
+  combine_strategy: "global_local"  # "concat" | "global_local" | "relay_only"
+
+# ---------------------------------------------------------------------------
+# CacheDiT – Hybrid Cache Acceleration
+# Repo: https://github.com/vipshop/cache-dit
+# Provides DBCache + TaylorSeer + SCM for 2-9× speedup
+# ---------------------------------------------------------------------------
+cache_dit:
+  enabled: true
+  algorithm: "DBCache"       # "DBCache" | "TaylorSeer" | "DBPrune"
+  # DBCache config (dual-block cache)
+  residual_diff_threshold: 0.08   # Cache when L1 diff < threshold
+  n_compute_blocks: 4             # Number of blocks computed normally before caching
+  # Context Parallelism: enable for multi-GPU inference
+  ulysses_size: 1            # Set to num_GPUs for multi-GPU
+
+# ---------------------------------------------------------------------------
+# TeaCache – Timestep Embedding Aware Cache
+# Paper: arXiv 2411.19108 – 4.41× speedup with negligible quality loss
+# Implementation: ali-vilab/TeaCache (integrated via hook)
+# ---------------------------------------------------------------------------
+tea_cache:
+  enabled: true
+  rel_l1_thresh: 0.3         # Relative L1 threshold for cache reuse decision
+  # Note: TeaCache and CacheDiT can stack; disable one if quality issues arise
+
+# ---------------------------------------------------------------------------
+# V-JEPA 2.1 – Dense Video Feature Extractor
+# Paper: arXiv 2603.14482 – dense, spatially-grounded video representations
+# Used for: (1) perceptual candidate scoring, (2) physics token injection
+# ---------------------------------------------------------------------------
+vjepa:
+  enabled: true
+  model_name: "facebook/vjepa2-vitl-fpc16-256"
+  # Use as perceptual scorer for ensemble selection
+  use_for_scoring: true
+  # Use as physics tokens injected into temporal attention (PhysVideoGenerator style)
+  # Paper: arXiv 2601.03665 – PhysVideoGenerator
+  use_physics_tokens: false   # Enable only if LoRA includes physics cross-attn layer
+
+# ---------------------------------------------------------------------------
+# Ensemble – Multi-Candidate Generation & Selection
+# ---------------------------------------------------------------------------
+ensemble:
+  enabled: true
+  n_candidates: 5            # Number of candidates to generate per test case
+  # Seeds for candidates: base_seed + {0, 1, 2, 3, 4}
+  # Selection criterion: weighted combination of scores
+  selection_metric: "composite"   # "clip_s" | "vjepa_sim" | "composite"
+  # Composite weights
+  weights:
+    clip_s: 0.4             # CLIP-S (text alignment)
+    vjepa_sim: 0.3          # V-JEPA perceptual similarity to history
+    history_consistency: 0.3  # Last history frame ↔ first generated frame similarity
+
+# ---------------------------------------------------------------------------
+# Post-processing
+# ---------------------------------------------------------------------------
+postprocess:
+  # Temporal consistency: blend adjacent frames to reduce flicker
+  temporal_smoothing:
+    enabled: true
+    window_size: 3           # Sliding window for temporal blend
+    alpha: 0.15              # Blend coefficient (0=no blend, 1=full average)
+  
+  # Per-frame quality enhancement (lightweight, fast)
+  frame_enhancement:
+    enabled: false           # Enable if PSNR/SSIM still low after generation
+    method: "unsharp_mask"  # "unsharp_mask" | "clahe" | "none"
+  
+  # Frame interpolation: upsample to higher FPS if required
+  interpolation:
+    enabled: false           # Enable if submission requires more frames than generated
+    target_fps: 24
+    method: "rife"           # "rife" | "film" | "linear"
+
+# ---------------------------------------------------------------------------
+# I/O paths
+# ---------------------------------------------------------------------------
+data:
+  test_json: "./data/wts/test_annotations.json"
+  history_frames_dir: "./data/wts/history_frames"
+  output_dir: "./outputs/submission"
+  
+logging:
+  level: "INFO"
+  use_wandb: false
+  project: "wts2026_track5"
