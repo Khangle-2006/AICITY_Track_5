@@ -5,18 +5,22 @@ The goal of this track is to generate a sequence of realistic future traffic fra
 
 ## Core Architecture
 
-Our solution builds upon the state-of-the-art **Wan2.2 (TI2V-5B)** Video Diffusion architecture, fundamentally re-engineered to tackle Multi-Agent Traffic Dynamics.
+Our solution builds upon the state-of-the-art **Wan2.2 (TI2V-5B)** Video Diffusion architecture, fundamentally re-engineered to tackle Multi-Agent Traffic Dynamics with SOTA ideas from **Bernini** (arXiv:2605.22344) and **PhysVideoGenerator** (arXiv:2601.03665).
 
 > [!NOTE]  
 > **CoECT Paper Alignment & Adaptation**:
 > While the original **CoECT** (arXiv:2603.09094) decomposes prompts purely via text-based LLM physical reasoning, it lacks visual grounding for video forecasting. To adapt CoECT for **WTS Track 5**, we developed a **hybrid CV-LLM pipeline**: we extract real-world motion vectors from the history frames $H$ using RAFT Optical Flow & Dynamic Motion Thresholding, translate them into text, and feed them into the CoECT reasoning prompt. This grounds the LLM reasoning in the actual visual history, preventing physics hallucinations.
+
+> [!IMPORTANT]
+> **Bernini & PhysVideoGen Integration**:
+> We incorporate two cutting-edge ideas: **(1) SA-3D RoPE** (Segment-Aware 3D Rotary Position Embedding) disambiguates history/pedestrian/vehicle tokens sharing the same (t,h,w) coordinates via learnable phase offsets. **(2) Source VAE Feature Injection** (Latent Inpainting) encodes all K history frames into latent space and concatenates them with the noisy latent via a binary inpainting mask. **(3) PredictorP + Physics Cross-Attention** predicts V-JEPA 2 physics tokens from the noisy latent and injects them into every 4th DiT block via gated cross-attention, ensuring physical consistency (gravity, velocity, TTC).
 
 We abandoned standard pixel-space composition and naive temporal concatenation in favor of a mathematically rigorous **Latent-Space Control Pipeline**.
 
 ```mermaid
 graph TD
     subgraph Input
-        H[History Frames 8]
+        H[History Frames K]
         CP[Caption Pedestrian]
         CV[Caption Vehicle]
     end
@@ -27,21 +31,32 @@ graph TD
     end
 
     subgraph LLM Causal Decomposition
-        COECT[CoECT Processor]
+        COECT[CoECT Processor + Chain-of-Thought]
         MD5[MD5 Caching]
-        JSON[Regex Parsing]
+        JSON[Regex Parsing + think-tag Stripping]
+    end
+
+    subgraph Bernini Conditioning
+        ROPE[SA-3D RoPE Phase Modulation]
+        VAEINJ[Source VAE Feature Injection]
+        MASK[Binary Inpainting Mask]
+    end
+
+    subgraph Physics Conditioning
+        PP[PredictorP - Conv3D + Transformer]
+        PCA[Gated Physics Cross-Attention]
     end
 
     subgraph Generation Pipeline
         PB[Prompt Builder]
         PR[Prompt Relay Router]
-        VAE[Wan2.2 3D-VAE]
-        DIT[CacheDiT + TeaCache]
-        LI[Latent Inpainting Mask]
+        VAE[Wan2.2 3D-VAE float32]
+        DIT[DiT Transformer + TeaCache + CacheDiT]
+        HOOK[Context-Managed Monkey-Patch Hook]
     end
     
     subgraph Evaluation
-        EG[Ensemble Generator]
+        EG[Ensemble Generator K=5]
         CLIPS[CLIP-S Scorer]
         SSIM[SSIM Anomaly Scorer]
         VJEPA[V-JEPA Feature Match]
@@ -57,57 +72,92 @@ graph TD
     PB --> |Segment Bounds| PR
     
     H --> |Modulo 16 Crop| VAE
-    VAE --> LI
-    LI --> DIT
+    H --> |Encode History| VAEINJ
+    VAEINJ --> |z_hist + mask| MASK
+    MASK --> HOOK
+    ROPE --> HOOK
+    PP --> |Physics Tokens| PCA
+    PCA --> HOOK
+    
+    HOOK --> DIT
     PR --> |Vectorized Penalty| DIT
     DIT --> |K Candidates| EG
     EG --> CLIPS & SSIM & VJEPA
-    CLIPS & SSIM & VJEPA --> |Best Index| Output[Future Frames 33]
+    CLIPS & SSIM & VJEPA --> |Best Index| Output[Future Frames N]
 ```
 
 ## Directory Structure
 
 ```text
 D:\TRACK5\
-├── run_inference.py          # End-to-end inference script (moved to root)
+├── configs/
+│   └── pipeline.yaml         # Master configuration (all hyperparams)
+├── run_inference.py          # End-to-end inference script
+├── test_integration.py       # API contract verification (8 tests)
 ├── data/
 │   └── wts_dataset.py        # Modulo 16 VAE-safe Dataloader
 ├── evaluation/               # WTS evaluation metrics
 ├── inference/
-│   ├── ensemble.py           # Multi-Candidate Generator & Scorers (CPU Offloaded)
+│   ├── ensemble.py           # Multi-Candidate Generator & Scorers
 │   └── inference.yaml        # Inference configurations
 ├── models/
-│   ├── tiv2_pipeline.py      # DualModelPipeline (Latent Inpainting, TeaCache, Mock Fallback)
-│   ├── train.py              # LoRA Fine-Tuning script (Flow-Matching Velocity Loss)
+│   ├── bernini_modules.py    # SA-3D RoPE + Source VAE Injection (arXiv:2605.22344)
+│   ├── physics_predictor.py  # PredictorP + Physics Cross-Attention (arXiv:2601.03665)
+│   ├── tiv2_pipeline.py      # DualModelPipeline + Deep Hooking + TeaCache + CacheDiT
+│   ├── train.py              # LoRA Fine-Tuning (Flow-Matching Velocity Loss)
 │   └── lora_finetune.yaml    # Training configurations
 ├── postprocess/              # Post-generation upscaling/filtering
 ├── prompt/
-│   ├── coect_processor.py    # LLM Simultaneous Causal Chain Extractor (Open-Source R1 support)
+│   ├── coect_processor.py    # LLM Causal Chain Extractor (Bernini CoT + DeepSeek-R1)
 │   ├── prompt_builder.py     # Prompt Optimizer (Token Dilution prevention)
-│   └── prompt_relay.py       # Cross-Attention DiT Hook
+│   └── prompt_relay.py       # Cross-Attention DiT Hook (arXiv:2604.10030)
 └── utils/
     └── motion_analyzer.py    # Padding-Safe Batched RAFT Flow
 ```
 
+## Key Technical Ideas
+
+### 1. Bernini SA-3D RoPE (arXiv:2605.22344)
+Segment-Aware 3D Rotary Position Embedding applies learnable phase offsets to distinguish between history frames (seg=1), target frames (seg=0), pedestrian tokens (seg=2), and vehicle tokens (seg=3). This prevents attention identity ambiguity when tokens share the same (t,h,w) coordinates.
+
+### 2. Source VAE Feature Injection (Latent Inpainting)
+All K history frames are encoded by the Wan2.2 VAE (float32), padded to match the target temporal length, and concatenated with the noisy latent along the channel dimension. A binary inpainting mask (1=known, 0=future) is appended. A Conv3D projection (2C+1 → C) restores the model's channel dimension. Zero-initialized for safe integration into pre-trained models.
+
+### 3. PhysVideoGenerator PredictorP (arXiv:2601.03665)
+A lightweight 4-layer Transformer predicts V-JEPA 2 physics tokens directly from the noisy latent. These tokens are injected via **Gated Cross-Attention** (zero-initialized gate) into every 4th DiT block, ensuring physical consistency without degrading pre-trained quality.
+
+### 4. Context-Managed Deep Hooking
+Since `diffusers` encapsulates the denoising loop, we use a `contextlib.contextmanager` to safely monkey-patch `pipe.transformer.forward` and individual DiT block `.forward` methods. All patches are automatically restored in the `finally` block, preventing memory leaks across 2,295 WTS clips.
+
+### 5. CoECT + Chain-of-Thought Planning
+CoECT decomposes traffic captions into causal temporal segments. With Bernini-inspired CoT, we allow LLMs (Claude/DeepSeek-R1/Qwen) to reason inside `<think>` tags before producing JSON. Our regex parser strips these tags automatically.
+
 ## Setup & Usage
 
 ### Requirements
+```bash
+pip install -r requirements.txt
+```
+
+Key dependencies:
 - `torch >= 2.4.0`
 - `diffusers >= 0.33.0`
-- `anthropic`
-- `transformers`
-- `peft`
+- `transformers`, `peft`, `open_clip_torch`
+- `anthropic` or `openai` (for CoECT LLM backend)
 
 ### Inference
-To run the full end-to-end inference pipeline:
 ```bash
 python run_inference.py
 ```
 
 ### LoRA Fine-Tuning
-To fine-tune Wan2.2 on the WTS Dataset using our Latent Inpainting Mask:
 ```bash
 python models/train.py
+```
+
+### Integration Tests
+```bash
+python test_integration.py
 ```
 
 ---

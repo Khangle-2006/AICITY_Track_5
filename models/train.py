@@ -12,8 +12,7 @@ reconstruct the FUTURE trajectory while conditioning on the UNMASKED HISTORY.
 import os
 import torch
 import torch.nn.functional as F
-from transformers import PreTrainedModel
-from diffusers import WanPipeline
+from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
 from diffusers.optimization import get_scheduler
 
 # Import PEFT for LoRA
@@ -34,7 +33,9 @@ def train_loop(
     dtype = torch.bfloat16
 
     print(f"Loading base model {model_id}...")
-    pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    # Separate VAE loading for Wan2.2 (float32 required)
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
+    pipe = WanImageToVideoPipeline.from_pretrained(model_id, vae=vae, torch_dtype=dtype).to(device)
     
     # Freeze everything except LoRA
     pipe.transformer.requires_grad_(False)
@@ -52,7 +53,7 @@ def train_loop(
 
     optimizer = torch.optim.AdamW(pipe.transformer.parameters(), lr=lr)
     
-    # Simple dataloader mock
+    # Simple dataloader
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     print("Starting LoRA Fine-Tuning with Latent Inpainting Mask...")
@@ -62,11 +63,17 @@ def train_loop(
         for step, batch in enumerate(dataloader):
             # batch contains:
             # - history_frames: (B, K, C, H, W)
-            # - future_frames: (B, N, C, H, W)
-            # - prompt: str
-            history_frames = batch["history"].to(device, dtype)
-            future_frames = batch["future"].to(device, dtype)
-            prompts = batch["prompt"]
+            # - target_frames: (B, N, C, H, W)
+            # - caption_pedestrian: List[str]
+            # - caption_vehicle: List[str]
+            history_frames = batch["history_frames"].to(device, dtype)
+            future_frames = batch["target_frames"].to(device, dtype)
+            
+            # Reconstruct prompts
+            prompts = []
+            for ped_cap, veh_cap in zip(batch["caption_pedestrian"], batch["caption_vehicle"]):
+                prompt = f"A traffic scene where {veh_cap.lower()} while {ped_cap.lower()}"
+                prompts.append(prompt)
 
             B = history_frames.shape[0]
 
@@ -83,8 +90,6 @@ def train_loop(
 
             # 2. Sample random timesteps (Flow Matching uses uniform t in [0, 1])
             # Wan2.2 uses FlowMatchEulerDiscreteScheduler
-            u = torch.rand((B,), device=device)
-            # Actually diffusers uses integer timesteps mapping to sigmas
             timesteps = torch.randint(0, 1000, (B,), device=device).long()
             
             # 3. Add noise to latents (Flow-Matching forward process)
@@ -100,17 +105,31 @@ def train_loop(
             # The network only needs to denoise the future (mask == 1)
             model_input = latents * (1 - mask) + noisy_latents * mask
 
-            # 6. Get text embeddings
+            # 6. Get text embeddings robustly
             with torch.no_grad():
-                # Simplified encoding
-                prompt_embeds = pipe.text_encoder(prompts) # pseudo-code
+                prompt_outputs = pipe._encode_prompt(
+                    prompt=prompts,
+                    device=device,
+                    num_videos_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                )
+                if isinstance(prompt_outputs, tuple):
+                    prompt_embeds = prompt_outputs[0]
+                else:
+                    prompt_embeds = prompt_outputs
 
             # 7. Predict noise/velocity
-            noise_pred = pipe.transformer(
-                model_input,
-                encoder_hidden_states=prompt_embeds,
+            transformer_output = pipe.transformer(
+                hidden_states=model_input,
                 timestep=timesteps,
-            ).sample
+                encoder_hidden_states=prompt_embeds,
+            )
+            if hasattr(transformer_output, "sample"):
+                noise_pred = transformer_output.sample
+            elif isinstance(transformer_output, tuple):
+                noise_pred = transformer_output[0]
+            else:
+                noise_pred = transformer_output
 
             # 8. Compute Flow-Matching Loss ONLY on the masked future regions
             # In Flow-Matching, the model predicts the velocity field (v_t = x_1 - x_0)
@@ -135,3 +154,4 @@ def train_loop(
 
 if __name__ == "__main__":
     print("Run this script with accelerate for distributed training.")
+

@@ -175,7 +175,7 @@ class PromptBuilder:
         # Initialize motion analyzer
         if use_motion_enrichment:
             self.motion_analyzer = MotionAnalyzer(
-                flow_method=flow_method,
+                method=flow_method,
                 device=flow_device,
             )
         else:
@@ -233,7 +233,6 @@ class PromptBuilder:
                     caption_vehicle=caption_vehicle,
                     phase_label=phase_label,
                     duration=duration,
-                    motion_context=motion_dict, # Pass structured motion features directly to CoECT LLM
                 )
             except Exception as e:
                 print(f"[PromptBuilder] CoECT failed: {e}")
@@ -241,10 +240,10 @@ class PromptBuilder:
         # ── Step 3: Build relay inputs ───────────────────────────────
         if coect_result is not None:
             # Use CoECT's decomposition for Prompt Relay
-            relay_inputs = coect_result.get("prompt_relay_inputs", {})
+            relay_inputs = coect_result.get("relay_inputs", {})
             global_prompt = coect_result.get("global_prompt", "")
             local_prompts = relay_inputs.get("local_prompts", [caption_pedestrian, caption_vehicle])
-            segment_lengths = relay_inputs.get("segment_lengths", [0.45, 0.55])
+            segment_lengths = relay_inputs.get("segment_lengths") or relay_inputs.get("segment_fractions") or [0.45, 0.55]
             enhanced_ped = coect_result.get("enhanced_pedestrian_prompt", caption_pedestrian)
             enhanced_veh = coect_result.get("enhanced_vehicle_prompt", caption_vehicle)
         else:

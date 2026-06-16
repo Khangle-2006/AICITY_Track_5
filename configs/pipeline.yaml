@@ -1,0 +1,156 @@
+# =============================================================================
+# configs/pipeline.yaml  –  Master pipeline configuration
+# WTS 2026 Challenge Track 5: Generative Traffic Video Forecasting
+# =============================================================================
+
+# --- Model ----------------------------------------------------------------
+model:
+  # Primary: Wan2.2 TI2V-5B (text + image → video, 5B dense)
+  # Both TI2V-5B and I2V-A14B load via WanImageToVideoPipeline + AutoencoderKLWan
+  ti2v_repo_id: "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  ti2v_local_dir: "./checkpoints/TI2V-5B"      # local cache (takes priority)
+  # Secondary (ensemble diversity): Wan2.2 I2V-A14B (MoE 27B / 14B active)
+  i2v_repo_id: "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+  i2v_local_dir: "./checkpoints/I2V-A14B"       # load on-demand only
+  dtype: "bfloat16"   # bf16 for A100/H100; use float16 for older GPUs
+  # CRITICAL: VAE must be float32 for Wan2.2 high-compression VAE quality
+  vae_dtype: "float32"
+  device: "cuda"
+
+# --- Generation hyperparams -----------------------------------------------
+generation:
+  guidance_scale: 5.0
+  num_inference_steps: 50
+  # Valid num_frames: (N-1) % 4 == 0  →  1, 5, 9, ..., 121
+  # Set to -1 to auto-compute from test case timing + source video FPS
+  default_num_frames: -1        # -1 = auto-detect from segment duration
+  default_fps: 16               # WTS overhead cameras typical FPS
+  max_frames_single_shot: 121   # TI2V-5B hard limit
+  chunk_overlap: 8              # overlap frames for cosine blend in chunked gen
+  negative_prompt: >
+    Bright tones, overexposed, static, blurred details, subtitles, style,
+    overall gray, worst quality, low quality, JPEG artifacts, ugly, mottled,
+    watermark, logo, distorted perspective, satellite, cartoon, painting.
+
+# --- LoRA -----------------------------------------------------------------
+lora:
+  enabled: true
+  weights_path: "./checkpoints/lora/traffic_lora_r64.safetensors"
+  alpha: 1.0
+  rank: 64
+
+# --- Bernini Modules (arXiv:2605.22344) -----------------------------------
+bernini:
+  # SA-3D RoPE: segment-aware positional embedding
+  # r̃_{t,h,w,i} = r_{t,h,w} ⊙ r^seg_i  (Eq. 2 in Bernini)
+  sa3d_rope:
+    enabled: true
+    n_segments: 4              # 0=target, 1=history, 2=ped text, 3=veh text
+    phase_scale: 0.3           # controls phase separation between segments
+  # Source VAE Feature Injection ("Latent Inpainting")
+  vae_injection:
+    enabled: true              # encode history frames → inject latents
+    injection_method: "concat" # "concat" | "add" | "cross_attn"
+    use_inpaint_mask: true     # binary mask: 1=known(hist), 0=future
+
+# --- PhysVideoGenerator (arXiv:2601.03665) --------------------------------
+physics:
+  enabled: true
+  # PredictorP: predicts V-JEPA 2 physics tokens from noisy latents
+  predictor_p:
+    hidden_dim: 256            # paper uses 512; 256 saves memory on single GPU
+    n_layers: 4
+    n_physics_tokens: 256      # compressed from V-JEPA 2048 → 256 via pooling
+  # Physics cross-attention: injected every N_th temporal block
+  inject_every_n_blocks: 4     # inject in blocks 0, 4, 8, ...
+  loss_weight: 0.1             # λ in L_total = L_flow + λ*L_phys (paper: λ=0.1)
+  # V-JEPA 2 for ground-truth physics tokens (training only)
+  vjepa_model: "./checkpoints/vjepa2"
+
+# --- CoECT (arXiv:2603.09094 + Bernini CoT) --------------------------------
+coect:
+  enabled: true
+  llm_backend: "anthropic"     # "anthropic" | "openai_compatible" | "none"
+  llm_model: "claude-sonnet-4-6"
+  # openai_compatible backend (for DeepSeek-R1, Qwen, local vLLM):
+  openai_base_url: "https://api.deepseek.com/v1"  # example
+  openai_model: "deepseek-reasoner"
+  # Bernini CoT: allow <think>...</think> reasoning before JSON
+  allow_chain_of_thought: true  # strip <think> tags before parsing
+  cache_dir: "./cache/coect"
+  max_segments: 4
+
+# --- Prompt Relay (arXiv:2604.10030) --------------------------------------
+prompt_relay:
+  enabled: true
+  sigma: 0.20                  # Gaussian decay (lower=harder boundary)
+  penalty_weight: 1.0
+  # Segment-wise attention mask (Bernini idea):
+  use_segment_mask: true       # ped tokens cannot attend to veh tokens
+
+# --- Motion Analyzer (WAN Animate insight + RAFT) -------------------------
+motion:
+  enabled: true
+  flow_method: "farneback"     # "farneback"(CPU fast) | "raft"(GPU accurate)
+  flow_device: "cpu"
+  composite_n_frames: 5
+  composite_method: "blend"    # "blend" | "ghost" | "last_only"
+  dynamic_threshold: true      # filter low-magnitude flow (noise suppression)
+  threshold_percentile: 25     # ignore bottom 25% magnitude as background noise
+
+# --- TeaCache (arXiv:2411.19108) ------------------------------------------
+tea_cache:
+  enabled: true
+  rel_l1_thresh: 0.25          # paper: 0.3 for ~4.4× speedup; 0.25 is safer
+  # Polynomial coefficients for Wan2.2 TI2V-5B (calibrated empirically)
+  poly_coeffs: [2.5651901, 3.842, 20.4165]
+
+# --- CacheDiT (github.com/vipshop/cache-dit) ------------------------------
+cache_dit:
+  enabled: true
+  algorithm: "DBCache"
+  residual_diff_threshold: 0.08
+
+# --- Ensemble & Scoring ---------------------------------------------------
+ensemble:
+  enabled: true
+  n_candidates: 5              # K candidates (TeaCache makes this ~same cost as 1)
+  base_seed: 42
+  # Candidate scoring weights (sum = 1.0)
+  weights:
+    clip_s: 0.40               # text-video alignment (CLIP ViT-L/14)
+    hist_consistency: 0.30     # last-hist-frame ↔ first-gen-frame pixel similarity
+    ssim_anomaly: 0.20         # SSIM anomaly detector (broken frames ratio)
+    vjepa_sim: 0.10            # V-JEPA perceptual continuity
+  ssim_anomaly_thresh: 0.65    # Bug Fix #5: flag frame only if SSIM < 0.65
+
+# --- LoRA Fine-tuning (train_lora.py) -------------------------------------
+training:
+  wts_data_dir: "./data/wts/train"
+  bdd_data_dir: "./data/bdd_pc_5k"
+  num_history_frames: 8
+  num_target_frames: 33
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  num_epochs: 3
+  max_steps: 2000
+  warmup_steps: 100
+  lr_scheduler: "cosine"
+  optimizer: "adamw"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  # Bug Fix #7: must use velocity target for FlowMatch scheduler
+  loss_target: "velocity"      # target = noise - latents (NOT noise alone)
+  train_resolution: [720, 1280]   # must be divisible by 16!
+  gradient_checkpointing: true
+  save_every_n_steps: 500
+  save_dir: "./checkpoints/lora"
+  use_wandb: false
+  wandb_project: "wts2026_track5"
+
+# --- I/O ------------------------------------------------------------------
+data:
+  test_json: "./data/wts/test_annotations.json"
+  history_dir: "./data/wts/history_frames"
+  output_dir: "./outputs/submission"

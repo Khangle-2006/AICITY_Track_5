@@ -474,6 +474,8 @@ class EnsembleGenerator:
             veh = prompt_package.get("enhanced_veh_prompt", "")
             clip_text = f"{ped} {veh}"[:500]  # clip prompt to reasonable length
 
+        relay_inputs = prompt_package.get("relay_inputs") if prompt_package else None
+
         for i in range(self.n_candidates):
             seed = self.base_seed + i
             print(f"[Ensemble] Generating candidate {i+1}/{self.n_candidates} (seed={seed})")
@@ -484,6 +486,7 @@ class EnsembleGenerator:
                 prompt=prompt,
                 n_frames=n_frames,
                 seed=seed,
+                relay_inputs=relay_inputs,
                 **generation_kwargs,
             )  # (n_frames, 3, H, W)
 
