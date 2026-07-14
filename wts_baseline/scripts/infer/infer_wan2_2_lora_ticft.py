@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from diffusers import WanVideoToVideoPipeline
 from src.datasets.collate import wts_collate_fn
-from src.datasets.wts_dataset import WTSDataset
+from src.datasets.wts_dataset import WTSDataset, infer_sample_type
 from src.datasets.transforms import denormalize_image
 from src.models.adapters import (
     apply_lora_to_pipeline,
@@ -197,40 +197,34 @@ def infer(args):
         print("   Proceeding with uninitialized LoRA (random initialization)")
     
     # Setup TIC-FT if enabled
-    tic_ft_manager = None
-    engine = None
-    if args.use_tic_ft_buffers:
-        tic_ft_manager = TICFTBufferManager(
-            buffer_frames=args.tic_ft_buffer_frames,
-            chunk_size=args.tic_ft_chunk_size,
-            overlap_frames=args.tic_ft_overlap,
-            noise_schedule=args.tic_ft_noise_schedule,
-        )
-        engine = RollingWindowInferenceEngine(
-            pipeline=pipeline,
-            tic_ft_manager=tic_ft_manager,
-            device=device,
-        )
-        print(f"✓ TIC-FT Buffer Manager & Rolling Window Inference Engine initialized")
-        print(f"  - Buffer frames: {args.tic_ft_buffer_frames}")
-        print(f"  - Chunk size: {args.tic_ft_chunk_size}")
-        print(f"  - Overlap: {args.tic_ft_overlap}")
+    tic_ft_manager = TICFTBufferManager(
+        buffer_frames=args.tic_ft_buffer_frames,
+        chunk_size=args.tic_ft_chunk_size,
+        overlap_frames=args.tic_ft_overlap,
+        noise_schedule=args.tic_ft_noise_schedule,
+    )
+    engine = RollingWindowInferenceEngine(
+        pipeline=pipeline,
+        tic_ft_manager=tic_ft_manager,
+        device=device,
+    )
+    print(f"✓ TIC-FT Buffer Manager & Rolling Window Inference Engine initialized")
+    print(f"  - Buffer frames: {args.tic_ft_buffer_frames}")
+    print(f"  - Chunk size: {args.tic_ft_chunk_size}")
+    print(f"  - Overlap: {args.tic_ft_overlap}")
     
     # Setup background preservation modules
-    background_module = None
-    compositor = None
-    if args.use_background_preservation:
-        background_module = BackgroundPreservationModule(
-            use_raft=False,
-            ransac_threshold=args.ransac_threshold,
-            motion_threshold=args.motion_threshold,
-            flow_stride=args.flow_stride,
-        ).to(device)
-        compositor = ForegroundBackgroundCompositor(
-            use_depth_aware=False,
-            motion_mask_weight=0.5,
-        ).to(device)
-        print("✓ Background preservation enabled")
+    background_module = BackgroundPreservationModule(
+        use_raft=False,
+        ransac_threshold=args.ransac_threshold,
+        motion_threshold=args.motion_threshold,
+        flow_stride=args.flow_stride,
+    ).to(device)
+    compositor = ForegroundBackgroundCompositor(
+        use_depth_aware=False,
+        motion_mask_weight=0.5,
+    ).to(device)
+    print("✓ Background preservation modules initialized")
     
     # Load dataset
     print(f"\n📂 Loading dataset from {args.manifest}...")
@@ -287,6 +281,24 @@ def infer(args):
         sample_type = batch["sample_type"][0]
         prompt = build_wan_prompt(caption, phase_label, sample_type)
         
+        # Override config based on sample_type
+        curr_use_background_preservation = args.use_background_preservation
+        curr_motion_threshold = args.motion_threshold
+        curr_guidance_scale = args.guidance_scale
+        curr_use_tic_ft_buffers = args.use_tic_ft_buffers
+        
+        if sample_type == "wts_overhead":
+            curr_use_background_preservation = True
+            curr_use_tic_ft_buffers = False
+        elif sample_type in ["bdd_front", "wts_vehicle"]:
+            curr_use_background_preservation = False
+            curr_motion_threshold = 0.5
+            curr_guidance_scale = 7.5
+            curr_use_tic_ft_buffers = True
+
+        if background_module is not None and hasattr(background_module, "flow_module"):
+            background_module.flow_module.motion_threshold = curr_motion_threshold
+        
         negative_prompt = (
             "Bright tones, overexposed, static, blurred details, subtitles, "
             "worst quality, low quality, JPEG compression residue, ugly, incomplete, "
@@ -297,7 +309,7 @@ def infer(args):
             prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                do_classifier_free_guidance=args.guidance_scale > 1.0,
+                do_classifier_free_guidance=curr_guidance_scale > 1.0,
                 num_videos_per_prompt=1,
                 max_sequence_length=512,
                 device=device,
@@ -310,7 +322,7 @@ def infer(args):
         
         # Generate frames using TIC-FT rolling window
         with torch.no_grad():
-            if args.use_tic_ft_buffers and engine is not None:
+            if curr_use_tic_ft_buffers and engine is not None:
                 # Use rolling window with TIC-FT buffers
                 try:
                     target_frames = int(batch["frame_length"][0]) if "frame_length" in batch else 81
@@ -320,7 +332,7 @@ def infer(args):
                         prompt_embeds=prompt_embeds,
                         negative_prompt_embeds=negative_prompt_embeds,
                         total_frames=target_frames,
-                        guidance_scale=args.guidance_scale,
+                        guidance_scale=curr_guidance_scale,
                         num_inference_steps=args.num_inference_steps,
                     )  # [1, T_hist + target_frames, C, H, W]
                     
@@ -340,7 +352,7 @@ def infer(args):
                     video=history_frames_01,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=negative_prompt_embeds,
-                    guidance_scale=args.guidance_scale,
+                    guidance_scale=curr_guidance_scale,
                     num_inference_steps=args.num_inference_steps,
                     height=args.height,
                     width=args.width,
@@ -355,7 +367,7 @@ def infer(args):
         generated_frames = _prepare_video_for_wan(generated_frames)
         
         # Background preservation
-        if args.use_background_preservation and background_module is not None:
+        if curr_use_background_preservation and background_module is not None:
             try:
                 generated_frames = preserve_background(
                     generated_frames,

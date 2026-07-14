@@ -24,6 +24,9 @@ def wts_collate_fn(batch):
     if "history_paths" in batch[0]:
         res["history_paths"] = [item["history_paths"] for item in batch]
 
+    if "history_indices" in batch[0]:
+        res["history_indices"] = [item["history_indices"] for item in batch]
+
     if "original_history_length" in batch[0]:
         res["original_history_length"] = [item["original_history_length"] for item in batch]
 

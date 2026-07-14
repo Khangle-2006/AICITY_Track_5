@@ -42,6 +42,17 @@ def main():
     if args.max_samples:
         dataset.samples = dataset.samples[: args.max_samples]
 
+    # Load Sa2VA descriptions if available
+    sa2va_understandings = {}
+    sa2va_file = "wts_baseline/prediction_wan2.2_ticft_sr/sa2va_understanding.json"
+    if os.path.exists(sa2va_file):
+        try:
+            with open(sa2va_file, "r") as f:
+                sa2va_understandings = json.load(f)
+            print(f"Loaded {len(sa2va_understandings)} understandings from {sa2va_file}")
+        except Exception as e:
+            print(f"Could not load Sa2VA understandings: {e}")
+
     print(f"Loading text_encoder for {args.model_id} ...")
     from diffusers import WanVideoToVideoPipeline as HFP
     pipe = HFP.from_pretrained(args.model_id, torch_dtype=torch.float16)
@@ -51,11 +62,27 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     for idx, sample in enumerate(dataset.samples):
+        sample_data = dataset[idx]
         caption = sample.get("merged_caption", sample.get("text", ""))
         scenario_name = sample.get("scenario_name", f"sample_{idx}")
+        
+        # Merge Sa2VA description if available (skipping any that triggered segment tokens)
+        if scenario_name in sa2va_understandings:
+            sa2va_desc = sa2va_understandings[scenario_name].get("sa2va_description", "")
+            if sa2va_desc and "[SEG]" not in sa2va_desc:
+                caption = f"{caption} Visual description: {sa2va_desc}"
+                print(f"  [Enriched Prompt] {scenario_name} with Sa2VA description.")
+            elif sa2va_desc:
+                print(f"  [Skip Enriched Prompt] {scenario_name} due to segment token [SEG] in description.")
+
         phase_label = torch.tensor(sample.get("phase_label", 0), device=device)
         sample_type = sample.get("sample_type", "unknown")
-        prompt = build_wan_prompt(caption, phase_label, sample_type)
+        
+        history_frames = sample_data.get("history_frames")
+        if history_frames is not None:
+            history_frames = history_frames.unsqueeze(0)  # add batch dimension B=1
+            
+        prompt = build_wan_prompt(caption, phase_label, sample_type, history_frames=history_frames)
 
         prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
             prompt=prompt,

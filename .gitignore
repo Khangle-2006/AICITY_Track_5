@@ -21,4 +21,7 @@ Danh_Tien_workspace/
 **/logs*/
 *.log
 wts_baseline/scratch/
-
+*.pt
+*.tar.gz
+**/model_cache/
+**/wts_classical_baseline/

@@ -20,11 +20,12 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.datasets.collate import wts_collate_fn
-from src.datasets.wts_dataset import WTSDataset
+from src.datasets.wts_dataset import WTSDataset, infer_sample_type
 from src.datasets.transforms import denormalize_image
 from src.pipelines.wan_video_pipeline import WanPipelineConfig, build_wan_prompt
 from src.models.disentanglement.optical_flow import BackgroundPreservationModule
 from src.models.compositing.alpha_blending import ForegroundBackgroundCompositor
+from src.models.adapters.tic_ft_buffer import TICFTBufferManager
 
 
 def safe_slice(output, T_hist, n_desired):
@@ -62,18 +63,64 @@ def prepare_video_for_wan(frames):
     return (frames * 0.5 + 0.5).clamp(0.0, 1.0)
 
 
-def build_chunk_input(history, homography, C_pad, background_module, use_bg):
-    """Build the input tensor for a generation chunk: history + padding."""
+def build_chunk_input(history, homography, C_pad, background_module, use_bg,
+                      ticft_manager=None):
+    """Build the input tensor for a generation chunk: history + [buffer] + padding.
+    
+    When ticft_manager is provided, inserts progressively-noised buffer frames
+    between history and generation-target padding for smooth temporal bridging.
+    """
     if use_bg:
         bg = background_module.flow_module.warp_future_background(history[:, -1], homography, C_pad)
     else:
-        bg = history[:, -1:].repeat(1, C_pad, 1, 1, 1)
+        try:
+            B, C_ch, H_img, W_img = history[:, -1].shape
+            s = 1.004  # gradual zoom-in (0.4% per frame) representing forward motion
+            H_zoom = torch.tensor([
+                [s, 0.0, (1.0 - s) * W_img / 2.0],
+                [0.0, s, (1.0 - s) * H_img / 2.0],
+                [0.0, 0.0, 1.0]
+            ], device=history.device, dtype=history.dtype)
+            
+            background_frames = []
+            current_homography = torch.eye(3, device=history.device, dtype=history.dtype)
+            for _ in range(C_pad):
+                current_homography = current_homography @ H_zoom
+                H_batch = current_homography.unsqueeze(0).repeat(B, 1, 1)
+                from src.models.disentanglement.optical_flow import warp_background
+                warped = warp_background(history[:, -1], H_batch)
+                background_frames.append(warped)
+            bg = torch.stack(background_frames, dim=1)
+            
+            # Keep the hood/capo of the vehicle (bottom 22% of the image) perfectly static
+            hood_height = int(0.78 * H_img)
+            bg[:, :, :, hood_height:] = history[:, -1:, :, hood_height:].repeat(1, C_pad, 1, 1, 1)
+        except Exception as e:
+            print(f"  [build_chunk_input] Error in zoom-in initialization: {e}. Falling back to static repeat.")
+            bg = history[:, -1:].repeat(1, C_pad, 1, 1, 1)
+    
+    if ticft_manager is not None:
+        # Create buffer frames from last history frame with progressive noise
+        T_buf = ticft_manager.buffer_frames
+        buffer_frames = ticft_manager._create_buffer_frames(
+            seed_frame=history[:, -1:],  # last history frame
+            num_buffers=T_buf,
+            noise_schedule=ticft_manager.get_noise_schedule(T_buf).to(history.device),
+            device=history.device,
+        )  # [B, T_buf, C, H, W] in [-1, 1]
+        return torch.cat([history, buffer_frames, bg], dim=1)
+    
     return torch.cat([history, bg], dim=1)
 
 
-def get_pad(C, T_hist):
-    """Compute padding to avoid VAE temporal truncation: total frames = 4*n + 1."""
-    return C + ((T_hist + C - 1) % 4)
+def get_pad(C, T_hist, T_buf=0):
+    """Compute padding to avoid VAE temporal truncation: total frames = 4*n + 1.
+    
+    Accounts for optional TIC-FT buffer frames in the total count.
+    """
+    import math
+    k = math.ceil((T_hist + T_buf + C - 1) / 4)
+    return 4 * k + 1 - T_hist - T_buf
 
 
 def blend_overlap(final_frames, chunk, t_start, O, n_write, device):
@@ -112,14 +159,202 @@ def run_chunk(pipe, vid_tensor, prompt_embeds, negative_prompt_embeds,
     return output
 
 
-def save_frames(frames, output_dir, scenario_name, output_height, output_width):
+def upscale_with_sr(frames, target_height, target_width, model_id="caidas/swin2SR-lightweight-x2-64", device="cuda"):
+    """
+    Perform Super-Resolution on frames [T, C, H, W] in [-1, 1] range using Swin2SR.
+    Crop the padded output and downscale to target_height x target_width.
+    """
+    import torchvision.transforms.functional as TF
+    from transformers import AutoImageProcessor, Swin2SRForImageSuperResolution
+    
+    print(f"  [SR] Loading Swin2SR model '{model_id}' to {device}...")
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = Swin2SRForImageSuperResolution.from_pretrained(model_id).to(device)
+    model.eval()
+    
+    T, C, H, W = frames.shape
+    upscaled_frames = []
+    
+    print(f"  [SR] Upscaling {T} frames...")
+    
+    # Process frames sequentially to conserve VRAM
+    for i in range(T):
+        # 1. Denormalize frame from [-1, 1] to [0, 1]
+        frame_denorm = denormalize_image(frames[i]) # [3, H, W]
+        
+        # 2. Convert to PIL Image for the HuggingFace processor
+        img_pil = TF.to_pil_image(frame_denorm.cpu())
+        
+        # 3. Process image (applies symmetric padding)
+        inputs = processor(img_pil, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # 4. Model inference
+        with torch.no_grad():
+            outputs = model(**inputs)
+            
+        # 5. Retrieve output reconstruction and clamp to [0, 1]
+        reconstruction = outputs.reconstruction # [1, 3, H_pad_x2, W_pad_x2]
+        
+        # 6. Crop out padding (padding was only added to the right and bottom)
+        h_up = 2 * H
+        w_up = 2 * W
+        reconstruction = reconstruction[:, :, :h_up, :w_up]
+        
+        # 7. Downscale to target resolution using high-quality bicubic downsampling
+        final_frame = F.interpolate(reconstruction, size=(target_height, target_width), mode="bicubic", align_corners=False)
+        
+        # 8. Squeeze the batch dimension and append
+        upscaled_frames.append(final_frame.squeeze(0).cpu())
+        
+        if (i + 1) % 20 == 0 or (i + 1) == T:
+            print(f"    Processed {i + 1}/{T} frames...")
+            
+    # Free model memory
+    del model
+    del processor
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # Return as a stacked tensor [T, C, target_height, target_width] in [0, 1] range
+    return torch.stack(upscaled_frames, dim=0)
+
+
+def apply_temporal_consistency_filter(upscaled_frames, device, sigma=0.05):
+    """
+    Applies optical flow-guided bidirectional temporal consistency filtering
+    on upscaled_frames tensor of shape [T, C, H, W] in the range [0, 1].
+    """
+    import torch
+    import torch.nn.functional as F
+    from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+    
+    T, C, H, W = upscaled_frames.shape
+    if T <= 1:
+        return upscaled_frames
+        
+    print(f"  [Temporal SR] Running optical flow temporal consistency filter on {T} frames...")
+    
+    weights = Raft_Large_Weights.DEFAULT
+    try:
+        raft_model = raft_large(weights=weights).eval().to(device)
+    except torch.OutOfMemoryError:
+        print("  [Temporal SR] CUDA OOM when loading RAFT to GPU, falling back to CPU.")
+        device = "cpu"
+        raft_model = raft_large(weights=weights).eval().to(device)
+    raft_transforms = weights.transforms()
+    
+    def warp_tensor(img, flow):
+        B, C, H_f, W_f = img.size()
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(0, H_f, dtype=flow.dtype, device=flow.device),
+            torch.arange(0, W_f, dtype=flow.dtype, device=flow.device),
+            indexing="ij"
+        )
+        grid = torch.stack((grid_x, grid_y), dim=0) # [2, H_f, W_f]
+        grid = grid.unsqueeze(0).repeat(B, 1, 1, 1) # [B, 2, H_f, W_f]
+        grid_warped = grid + flow # [B, 2, H_f, W_f]
+        grid_warped_x = 2.0 * grid_warped[:, 0] / max(W_f - 1, 1) - 1.0
+        grid_warped_y = 2.0 * grid_warped[:, 1] / max(H_f - 1, 1) - 1.0
+        grid_sample_format = torch.stack((grid_warped_x, grid_warped_y), dim=-1) # [B, H_f, W_f, 2]
+        return F.grid_sample(img, grid_sample_format, mode="bilinear", padding_mode="border", align_corners=True)
+
+    frames_dev = upscaled_frames.to(device)
+    
+    h_pad = (8 - H % 8) % 8
+    w_pad = (8 - W % 8) % 8
+    if h_pad > 0 or w_pad > 0:
+        frames_padded = F.pad(frames_dev, (0, w_pad, 0, h_pad), mode="replicate")
+    else:
+        frames_padded = frames_dev
+        
+    forward_consistent = [frames_dev[0]]
+    for t in range(1, T):
+        img1 = frames_padded[t-1:t]
+        img2 = frames_padded[t:t+1]
+        
+        img1_255 = img1 * 255.0
+        img2_255 = img2 * 255.0
+        
+        img1_t, img2_t = raft_transforms(img1_255, img2_255)
+        
+        with torch.no_grad():
+            flow = raft_model(img1_t, img2_t)[-1]
+            
+        prev_padded = F.pad(forward_consistent[-1].unsqueeze(0), (0, w_pad, 0, h_pad), mode="replicate")
+        warped_prev = warp_tensor(prev_padded, flow)
+        warped_prev_cropped = warped_prev[0, :, :H, :W]
+        
+        raw_frame = frames_dev[t]
+        diff = torch.abs(warped_prev_cropped - raw_frame).mean(dim=0, keepdim=True)
+        blend_mask = torch.exp(-diff / sigma)
+        
+        smoothed = blend_mask * warped_prev_cropped + (1.0 - blend_mask) * raw_frame
+        forward_consistent.append(smoothed)
+        
+    forward_consistent = torch.stack(forward_consistent, dim=0)
+    
+    backward_consistent = [frames_dev[-1]]
+    for t in range(T - 2, -1, -1):
+        img1 = frames_padded[t+1:t+2]
+        img2 = frames_padded[t:t+1]
+        
+        img1_255 = img1 * 255.0
+        img2_255 = img2 * 255.0
+        
+        img1_t, img2_t = raft_transforms(img1_255, img2_255)
+        
+        with torch.no_grad():
+            flow = raft_model(img1_t, img2_t)[-1]
+            
+        next_padded = F.pad(backward_consistent[-1].unsqueeze(0), (0, w_pad, 0, h_pad), mode="replicate")
+        warped_next = warp_tensor(next_padded, flow)
+        warped_next_cropped = warped_next[0, :, :H, :W]
+        
+        raw_frame = frames_dev[t]
+        diff = torch.abs(warped_next_cropped - raw_frame).mean(dim=0, keepdim=True)
+        blend_mask = torch.exp(-diff / sigma)
+        
+        smoothed = blend_mask * warped_next_cropped + (1.0 - blend_mask) * raw_frame
+        backward_consistent.append(smoothed)
+        
+    backward_consistent.reverse()
+    backward_consistent = torch.stack(backward_consistent, dim=0)
+    
+    final_consistent = 0.5 * (forward_consistent + backward_consistent)
+    
+    del raft_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return final_consistent.cpu()
+
+
+def save_frames(frames, output_dir, scenario_name, output_height, output_width, args, device="cuda"):
     sample_dir = os.path.join(output_dir, scenario_name)
     os.makedirs(sample_dir, exist_ok=True)
-    resized = resize_for_submission(frames[0], output_height, output_width)
-    for i in range(resized.size(0)):
-        torchvision.utils.save_image(
-            denormalize_image(resized[i]), os.path.join(sample_dir, f"{i}.png")
-        )
+    
+    # Save raw frames at 480x832 if requested
+    if hasattr(args, "save_raw_frames") and args.save_raw_frames:
+        raw_dir = os.path.join(output_dir + "_raw", scenario_name)
+        os.makedirs(raw_dir, exist_ok=True)
+        for i in range(frames[0].size(0)):
+            torchvision.utils.save_image(
+                denormalize_image(frames[0][i]), os.path.join(raw_dir, f"{i}.png")
+            )
+            
+    if hasattr(args, "use_sr") and args.use_sr:
+        upscaled = upscale_with_sr(frames[0], output_height, output_width, args.sr_model, device)
+        if hasattr(args, "use_temporal_sr") and args.use_temporal_sr:
+            upscaled = apply_temporal_consistency_filter(upscaled, device, args.temporal_sr_sigma)
+        for i in range(upscaled.size(0)):
+            torchvision.utils.save_image(upscaled[i], os.path.join(sample_dir, f"{i}.png"))
+    else:
+        resized = resize_for_submission(frames[0], output_height, output_width)
+        for i in range(resized.size(0)):
+            torchvision.utils.save_image(
+                denormalize_image(resized[i]), os.path.join(sample_dir, f"{i}.png")
+            )
 
 
 def save_ground_truth(batch, output_dir, scenario_name, output_height, output_width):
@@ -149,6 +384,8 @@ def infer(args):
     print(f"Wan2.2 V2V Inference | Model: {args.model_id}")
     print(f"Res: {args.height}x{args.width} -> {args.output_width}x{args.output_height}")
     print(f"Steps: {args.num_inference_steps}, CFG: {args.guidance_scale}")
+    if args.use_ticft:
+        print(f"TIC-FT: {args.ticft_buffer_frames} buffer frames, {args.ticft_noise_schedule} schedule")
     print("=" * 72)
 
     device = torch.device("cuda")
@@ -189,6 +426,13 @@ def infer(args):
         use_depth_aware=False, motion_mask_weight=0.5,
     ).to(device)
 
+    # Setup TIC-FT buffer manager
+    ticft_manager = TICFTBufferManager(
+        buffer_frames=args.ticft_buffer_frames,
+        noise_schedule=args.ticft_noise_schedule,
+    )
+    print(f"✓ TIC-FT Buffer Manager initialized (buffers={args.ticft_buffer_frames}, schedule={args.ticft_noise_schedule})")
+
     config = WanPipelineConfig(
         model_id=args.model_id, torch_dtype=args.torch_dtype,
         height=args.height, width=args.width,
@@ -198,6 +442,7 @@ def infer(args):
         max_sequence_length=args.max_sequence_length, chunk_size=args.chunk_size,
         output_width=args.output_width, output_height=args.output_height,
         use_background_preservation=args.use_background_preservation,
+        use_3dgs=args.use_3dgs,
         use_alpha_compositing=args.use_alpha_compositing,
         use_dynamic_cfg=args.use_dynamic_cfg,
     )
@@ -212,6 +457,9 @@ def infer(args):
         vae.enable_tiling()
         vae.enable_slicing()
     pipe = HFP.from_pretrained(args.model_id, torch_dtype=torch.float16, vae=vae)
+    if hasattr(args, "enable_sequential_cpu_offload") and args.enable_sequential_cpu_offload:
+        print("Enabling model CPU offload for pipeline...")
+        pipe.enable_model_cpu_offload()
     
     print("🩹 Patching VAE encode/decode for dtype compatibility...")
     original_vae_encode = pipe.vae.encode
@@ -220,19 +468,23 @@ def infer(args):
     def patched_vae_encode(x, *args, **kwargs):
         vae_dtype = next(pipe.vae.parameters()).dtype
         vae_device = next(pipe.vae.parameters()).device
-        weight_device = pipe.vae.encoder.conv_in.weight.device
-        weight_dtype = pipe.vae.encoder.conv_in.weight.dtype
-        print(f"DEBUG VAE ENCODE: input device={x.device}, dtype={x.dtype} | VAE device={vae_device}, dtype={vae_dtype}")
-        print(f"DEBUG CONV_IN: weight device={weight_device}, dtype={weight_dtype}")
+        if vae_device.type == "meta" or vae_device.type == "cpu":
+            pipe.vae.to(device=x.device)
+            vae_device = x.device
+        print(f"DEBUG VAE ENCODE: input device={x.device}, dtype={x.dtype} | VAE dtype={vae_dtype} device={vae_device}")
+        if vae_device.type != "meta":
+            x = x.to(device=vae_device)
         return original_vae_encode(x.to(dtype=vae_dtype), *args, **kwargs)
         
     def patched_vae_decode(z, *args, **kwargs):
         vae_dtype = next(pipe.vae.parameters()).dtype
         vae_device = next(pipe.vae.parameters()).device
-        weight_device = pipe.vae.decoder.conv_in.weight.device
-        weight_dtype = pipe.vae.decoder.conv_in.weight.dtype
-        print(f"DEBUG VAE DECODE: input device={z.device}, dtype={z.dtype} | VAE device={vae_device}, dtype={vae_dtype}")
-        print(f"DEBUG CONV_IN: weight device={weight_device}, dtype={weight_dtype}")
+        if vae_device.type == "meta" or vae_device.type == "cpu":
+            pipe.vae.to(device=z.device)
+            vae_device = z.device
+        print(f"DEBUG VAE DECODE: input device={z.device}, dtype={z.dtype} | VAE dtype={vae_dtype} device={vae_device}")
+        if vae_device.type != "meta":
+            z = z.to(device=vae_device)
         return original_vae_decode(z.to(dtype=vae_dtype), *args, **kwargs)
         
     pipe.vae.encode = patched_vae_encode
@@ -266,6 +518,27 @@ def infer(args):
         history_frames = batch["history_frames"].to(device)
         phase_label = batch["phase_label"][0].to(device)
         sample_type = batch["sample_type"][0]
+        
+        # Override config based on sample_type
+        curr_use_background_preservation = args.use_background_preservation
+        curr_motion_threshold = args.motion_threshold
+        curr_guidance_scale = args.guidance_scale
+        curr_use_ticft = args.use_ticft
+        
+        if sample_type == "wts_overhead":
+            curr_use_background_preservation = True
+            curr_use_ticft = False
+        elif sample_type in ["bdd_front", "wts_vehicle"]:
+            curr_use_background_preservation = False
+            curr_motion_threshold = 0.5
+            curr_guidance_scale = 7.5
+            curr_use_ticft = True
+            
+        config.guidance_scale = curr_guidance_scale
+        config.use_background_preservation = curr_use_background_preservation
+        if background_module is not None and hasattr(background_module, "flow_module"):
+            background_module.flow_module.motion_threshold = curr_motion_threshold
+
         caption = batch["merged_caption"][0]
         prompt = build_wan_prompt(caption, phase_label, sample_type)
 
@@ -279,17 +552,19 @@ def infer(args):
         negative_prompt_embeds = embeds["negative_prompt_embeds"].to(device, dtype=dtype)
         del embeds
 
-        using_cpu_offload = False
-        pipe.vae = pipe.vae.to(device)
-        pipe.transformer = pipe.transformer.to(device)
-        if hasattr(pipe, "transformer_2") and pipe.transformer_2 is not None:
-            pipe.transformer_2 = pipe.transformer_2.to("cpu")
+        using_cpu_offload = args.enable_sequential_cpu_offload
+        if not using_cpu_offload:
+            pipe.vae = pipe.vae.to(device)
+            pipe.transformer = pipe.transformer.to("cpu")
+            if hasattr(pipe, "transformer_2") and pipe.transformer_2 is not None:
+                pipe.transformer_2 = pipe.transformer_2.to("cpu")
         print(f"  [GPU] models loaded (transformer & VAE): {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
 
         T_hist = history_frames.shape[1]
         max_chunk = min(args.chunk_size, target_frames)
+        T_buf = ticft_manager.buffer_frames if (curr_use_ticft and ticft_manager is not None) else 0
 
-        if args.use_background_preservation:
+        if background_module is not None:
             homography, _, history_flow_map = background_module.flow_module(history_frames)
         else:
             homography = None
@@ -303,10 +578,9 @@ def infer(args):
         L = 0
         chunk_idx = 0
         while L < target_frames:
-            C = min(target_frames - L, max_chunk)
-            C_pad = get_pad(C, T_hist)
-
             if L == 0:
+                t_start = 0
+                O = 0
                 curr_history = history_frames
             else:
                 O = min(args.overlap_frames, L)
@@ -314,9 +588,13 @@ def infer(args):
                 seq = torch.cat([history_frames, final_frames[:, :L]], dim=1)
                 curr_history = seq[:, t_start:t_start + T_hist]
 
+            C = min(target_frames - t_start, max_chunk)
+            C_pad = get_pad(C, T_hist, T_buf)
+
             frames_input = build_chunk_input(
                 curr_history, homography, C_pad,
-                background_module, args.use_background_preservation,
+                background_module, curr_use_background_preservation,
+                ticft_manager=ticft_manager if curr_use_ticft else None,
             )
             vid_tensor = prepare_video_for_wan(frames_input)
 
@@ -326,9 +604,9 @@ def infer(args):
                 print(f"  ERROR in pipe() chunk {chunk_idx}")
                 break
 
-            chunk, n_avail = safe_slice(output, T_hist, C)
+            chunk, n_avail = safe_slice(output, T_hist + T_buf, C)
 
-            if args.use_background_preservation:
+            if curr_use_background_preservation:
                 chunk = preserve_background(chunk, curr_history, background_module, compositor)
 
             if L == 0:
@@ -339,10 +617,15 @@ def infer(args):
                 blend_overlap(final_frames, chunk, t_start, O, n_write, device)
                 L = t_start + n_write
 
+            print(f"  [Chunk {chunk_idx}] L={L}, C={C}, O={O if L > n_avail else 0}, t_start={t_start if L > n_avail else 0}, n_avail={n_avail}, n_write={n_write if L > n_avail else n_avail}")
             chunk_idx += 1
 
         composited = final_frames[:, :target_frames]
-        save_frames(composited, args.output_dir, scenario_name, args.output_height, args.output_width)
+        cleanup_gpu(pipe, using_cpu_offload=using_cpu_offload)
+        if not args.keep_on_gpu and not using_cpu_offload:
+            print(f"  [GPU] after cleanup: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
+
+        save_frames(composited, args.output_dir, scenario_name, args.output_height, args.output_width, args, device)
         save_ground_truth(batch, args.output_dir, scenario_name, args.output_height, args.output_width)
 
         sample_idx += 1
@@ -351,9 +634,6 @@ def infer(args):
         prompt_embeds = None
         negative_prompt_embeds = None
         output = None
-        cleanup_gpu(pipe, using_cpu_offload=using_cpu_offload)
-        if not args.keep_on_gpu and not using_cpu_offload:
-            print(f"  [GPU] after cleanup: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
 
     elapsed = time.time() - start_time
     n = max(sample_idx, 1)
@@ -398,6 +678,28 @@ def main():
                              "float32 enables tiling (lower memory).")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument("--enable_sequential_cpu_offload", action="store_true", default=False,
+                        help="Enable sequential CPU offload for pipeline layers (extremely VRAM efficient).")
+    parser.add_argument("--use_sr", action="store_true", default=False,
+                        help="Enable Super-Resolution upscaling using Swin2SR.")
+    parser.add_argument("--sr_model", type=str, default="caidas/swin2SR-lightweight-x2-64",
+                        help="HuggingFace model ID for the Swin2SR model.")
+    parser.add_argument("--use_temporal_sr", action="store_true", default=False,
+                        help="Enable optical flow-guided bidirectional temporal consistency filtering on upscaled frames.")
+    parser.add_argument("--temporal_sr_sigma", type=float, default=0.05,
+                        help="Sigma parameter for temporal consistency blending.")
+    parser.add_argument("--use_3dgs", action="store_true", default=False,
+                        help="Enable 3D Gaussian Splatting / 3D Point-Cloud Splatting for background preservation.")
+    parser.add_argument("--save_raw_frames", action="store_true", default=False,
+                        help="Save the raw (un-upscaled) generated frames in a parallel folder with suffix _raw.")
+    # TIC-FT arguments
+    parser.add_argument("--use_ticft", action="store_true", default=False,
+                        help="Enable TIC-FT buffer frame insertion for smoother temporal transitions.")
+    parser.add_argument("--ticft_buffer_frames", type=int, default=5,
+                        help="Number of TIC-FT buffer frames to insert between history and generation target.")
+    parser.add_argument("--ticft_noise_schedule", type=str, default="cosine",
+                        choices=["linear", "cosine"],
+                        help="Noise schedule for TIC-FT buffer frames (cosine=smoother transitions).")
 
     args = parser.parse_args()
     if not os.path.exists(args.manifest):

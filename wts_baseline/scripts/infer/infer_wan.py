@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.datasets.collate import wts_collate_fn
-from src.datasets.wts_dataset import WTSDataset
+from src.datasets.wts_dataset import WTSDataset, infer_sample_type
 from src.pipelines.wan_video_pipeline import WanPipelineConfig, WanSOTAPipeline
 
 
@@ -42,6 +42,13 @@ def infer(args):
         history_strategy=args.history_strategy,
     )
     print(f"Loaded {len(dataset)} samples for inference.")
+
+    if args.world_size > 1:
+        samples_per_rank = len(dataset.samples) // args.world_size
+        start_idx = args.rank * samples_per_rank
+        end_idx = start_idx + samples_per_rank if args.rank < args.world_size - 1 else len(dataset.samples)
+        dataset.samples = dataset.samples[start_idx:end_idx]
+        print(f"[Rank {args.rank}/{args.world_size}] Partitioned dataset: processing indices {start_idx} to {end_idx} ({len(dataset.samples)} samples).")
 
     dataloader = DataLoader(
         dataset, batch_size=1, shuffle=False,
@@ -73,10 +80,39 @@ def infer(args):
     os.makedirs(args.output_dir, exist_ok=True)
     sample_idx = 0
     start_time = time.time()
-
     for batch in dataloader:
-        if sample_idx >= args.max_samples:
+        if args.max_samples > 0 and sample_idx >= args.max_samples:
             break
+
+        scenario_name = batch["scenario_name"][0]
+        sample_type = batch.get("sample_type", ["unknown"])[0]
+        if sample_type == "unknown":
+            sample_type = infer_sample_type(scenario_name)
+
+        # Override config based on sample_type
+        curr_use_background_preservation = args.use_background_preservation
+        curr_motion_threshold = 0.05
+        curr_guidance_scale = args.guidance_scale
+        
+        if sample_type == "wts_overhead":
+            curr_use_background_preservation = True
+        elif sample_type in ["bdd_front", "wts_vehicle"]:
+            curr_use_background_preservation = False
+            curr_motion_threshold = 0.5
+            curr_guidance_scale = 7.5
+
+        pipeline.config.use_background_preservation = curr_use_background_preservation
+        pipeline.config.guidance_scale = curr_guidance_scale
+        if hasattr(pipeline, "background_module") and pipeline.background_module is not None:
+            if hasattr(pipeline.background_module, "flow_module"):
+                pipeline.background_module.flow_module.motion_threshold = curr_motion_threshold
+
+        sample_dir = os.path.join(args.output_dir, scenario_name)
+        target_frames = int(batch.get("frame_length", [args.chunk_size])[0])
+        if os.path.exists(sample_dir) and len([f for f in os.listdir(sample_dir) if f.endswith(".png")]) >= target_frames:
+            print(f"  [SKIPPING] {scenario_name} (already generated with {target_frames} frames)")
+            sample_idx += 1
+            continue
 
         pred_frames = pipeline.generate_batch(batch)
         sample_dir = pipeline.save_batch(batch, pred_frames, args.output_dir)
@@ -104,7 +140,7 @@ def main():
                         default="/workspace/wts_baseline/data/manifests/test.jsonl")
     parser.add_argument("--output_dir", type=str,
                         default="/workspace/wts_baseline/prediction_wan_sota")
-    parser.add_argument("--max_samples", type=int, default=3)
+    parser.add_argument("--max_samples", type=int, default=0)
 
     # WAN model
     parser.add_argument("--model_id", type=str,
@@ -141,6 +177,8 @@ def main():
 
     # Data
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world_size", type=int, default=1)
 
     args = parser.parse_args()
 

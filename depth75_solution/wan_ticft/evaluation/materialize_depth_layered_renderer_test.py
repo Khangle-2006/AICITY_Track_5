@@ -23,6 +23,7 @@ from wan_ticft.evaluation.materialize_depth_layered_renderer import (
     render_confidence,
     smooth_pose_sequence,
     zbuffer_splat,
+    compute_raft_flow,
 )
 
 
@@ -54,11 +55,34 @@ def main() -> None:
     parser.add_argument("--filled_pose_scale", type=float, default=0.35)
     parser.add_argument("--confidence_ema", type=float, default=0.65)
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    
+    # New options
+    parser.add_argument("--matcher", default="orb", choices=["orb", "superpoint"])
+    parser.add_argument("--depth_model", default="midas", choices=["midas", "depthanything", "depthanything_small", "depthanything_base", "depthanything_large"])
+    parser.add_argument("--segment_model", default="deeplabv3", choices=["deeplabv3", "yolov8", "sam2"])
+    parser.add_argument("--disocclusion_inpainting", action="store_true")
+    parser.add_argument("--alpha_decay", default="none", choices=["none", "linear", "exponential"])
+    parser.add_argument("--alpha_decay_rate", type=float, default=0.95)
+    parser.add_argument("--alpha_depth_weighting", action="store_true")
+
     args = parser.parse_args()
 
     if not 0.0 <= args.alpha <= 1.0:
         raise ValueError("--alpha must be in [0, 1]")
     cv2_module, _ = import_cv2_np()
+
+    def warmup_directory(path: Path, retries: int = 5):
+        import time
+        import os
+        for i in range(retries):
+            try:
+                if path.exists():
+                    os.listdir(str(path))
+                    break
+            except Exception:
+                time.sleep(0.5)
+
     if args.clean and args.out_dir.exists():
         shutil.rmtree(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -68,21 +92,83 @@ def main() -> None:
     device = torch.device("cuda")
     models = PerceptionModels(device, args.model_cache)
     rows = [row for row in read_csv(args.test_csv) if row.get("view_type") == args.view_type]
+    if args.limit is not None:
+        rows = rows[:args.limit]
+
+    existing_reports = []
+    report_path = args.out_dir / "report.csv"
+    if not args.clean and report_path.exists():
+        try:
+            with report_path.open(encoding="utf-8", newline="") as handle:
+                existing_reports = list(csv.DictReader(handle))
+        except Exception:
+            pass
+
+    existing_diagnostics = []
+    diag_path = args.out_dir / "diagnostics.csv"
+    if not args.clean and diag_path.exists():
+        try:
+            with diag_path.open(encoding="utf-8", newline="") as handle:
+                existing_diagnostics = list(csv.DictReader(handle))
+        except Exception:
+            pass
+
     report_rows, diagnostic_rows = [], []
     for position, row in enumerate(rows, start=1):
         output_name = row["source_folder"]
         target_n = int(row["target_N"])
+        sample_out = args.out_dir / output_name
+
+        if not args.clean and sample_out.exists():
+            verified = verify_sample_output(sample_out, target_n)
+            if verified.ok:
+                match = next((r for r in existing_reports if r.get("output_name") == output_name), None)
+                if match is not None:
+                    report_rows.append(match)
+                else:
+                    report_rows.append(
+                        {
+                            "output_name": output_name,
+                            "sample_id": row["sample_id"],
+                            "view_type": row["view_type"],
+                            "target_N": target_n,
+                            "frames_found": verified.frames_found,
+                            "alpha": f"{args.alpha:.6f}",
+                            "status": "ok",
+                        }
+                    )
+                diagnostic_rows.extend([d for d in existing_diagnostics if d.get("output_name") == output_name])
+                print(f"[{position}/{len(rows)}] {output_name} | already completed & verified, resuming/skipping", flush=True)
+                continue
+
         conditions = load_rgb_paths(cv2_module, numeric_pngs(Path(row["input_dir"])))
         bases = load_rgb_paths(cv2_module, numeric_pngs(args.base_dir / output_name))
-        if not conditions or len(bases) != target_n:
-            raise RuntimeError(
-                f"{output_name}: conditions={len(conditions)} base_frames={len(bases)} expected={target_n}"
-            )
+        
+        if not conditions:
+            raise RuntimeError(f"{output_name}: input conditions are missing at {row['input_dir']}")
+            
+        if len(bases) == 0:
+            print(f"[{position}/{len(rows)}] WARNING: {output_name} has 0 base frames. Using duplicated last condition frame as base.")
+            last_cond = conditions[-1]
+            bases = [last_cond.copy() for _ in range(target_n)]
+        
+        if len(bases) < target_n:
+            print(f"[{position}/{len(rows)}] Padding bases for {output_name} from {len(bases)} to {target_n} by replicating last frame.")
+            last_frame = bases[-1]
+            while len(bases) < target_n:
+                bases.append(last_frame.copy())
+        elif len(bases) > target_n:
+            bases = bases[:target_n]
+
         height, width = bases[0].shape[:2]
         anchor = cv2_module.resize(conditions[-1], (width, height), interpolation=cv2_module.INTER_AREA)
         bases = [cv2_module.resize(frame, (width, height), interpolation=cv2_module.INTER_AREA) for frame in bases]
-        depth = models.depth(anchor)
-        masks = models.actor_masks([anchor, *bases], args.segment_batch)
+        
+        # Custom depth model
+        depth = models.depth(anchor, model_type=args.depth_model)
+        
+        # Custom segmentation model
+        masks = models.actor_masks([anchor, *bases], args.segment_batch, model_type=args.segment_model)
         anchor_actor, base_actors = masks[0], masks[1:]
         static_mask = (anchor_actor < 0.1).astype(np.float32)
         intrinsic = camera_matrix(width, height, args.focal_scale)
@@ -90,7 +176,8 @@ def main() -> None:
         raw_poses, pose_diagnostics, raw_qualities = [], [], []
         for base in bases:
             pose, diagnostic = estimate_pose(
-                anchor, base, depth, anchor_actor, intrinsic, args.min_matches, args.min_inliers
+                anchor, base, depth, anchor_actor, intrinsic, args.min_matches, args.min_inliers,
+                models=models, matcher=args.matcher
             )
             raw_poses.append(pose)
             pose_diagnostics.append(diagnostic)
@@ -113,6 +200,22 @@ def main() -> None:
                 rendered, coverage = zbuffer_splat(
                     anchor, depth, static_mask, pose, intrinsic, args.point_stride, args.splat_radius
                 )
+                
+                # Pro-active disocclusion inpainting using RAFT
+                if args.disocclusion_inpainting:
+                    disocclusion_mask = ((static_mask > 0.5) & (coverage < 0.1)).astype(np.float32)
+                    if disocclusion_mask.sum() > 0:
+                        flow = compute_raft_flow(models, anchor, base)
+                        flow_y, flow_x = flow[..., 1], flow[..., 0]
+                        grid_y, grid_x = np.mgrid[0:height, 0:width]
+                        map_x = (grid_x + flow_x).astype(np.float32)
+                        map_y = (grid_y + flow_y).astype(np.float32)
+                        warped = cv2_module.remap(anchor, map_x, map_y, cv2_module.INTER_LINEAR)
+                        
+                        blend_mask = cv2_module.GaussianBlur(disocclusion_mask, (5, 5), 0.0)[..., None]
+                        rendered = (rendered.astype(np.float32) * (1.0 - blend_mask) + warped.astype(np.float32) * blend_mask).astype(np.uint8)
+                        coverage = np.clip(coverage + disocclusion_mask, 0.0, 1.0)
+                        
             confidence = render_confidence(
                 base,
                 rendered,
@@ -123,7 +226,18 @@ def main() -> None:
                 previous_confidence,
                 args.confidence_ema,
             )
-            output = compose(base, rendered, confidence, args.alpha)
+            
+            # Adaptive alpha decay calculation
+            effective_alpha = args.alpha
+            if args.alpha_decay == "linear":
+                effective_alpha = args.alpha * (1.0 - frame_index / len(bases))
+            elif args.alpha_decay == "exponential":
+                effective_alpha = args.alpha * (args.alpha_decay_rate ** frame_index)
+                
+            output = compose(
+                base, rendered, confidence, effective_alpha,
+                depth=depth, use_depth_weighting=args.alpha_depth_weighting
+            )
             if not write_rgb(cv2_module, sample_out / f"{frame_index}.png", output):
                 raise RuntimeError(f"cannot write {sample_out / f'{frame_index}.png'}")
             previous_confidence = confidence
@@ -156,14 +270,16 @@ def main() -> None:
         )
         print(f"[{position}/{len(rows)}] {output_name} | ok", flush=True)
 
-    with (args.out_dir / "report.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=report_rows[0].keys())
-        writer.writeheader()
-        writer.writerows(report_rows)
-    with (args.out_dir / "diagnostics.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=diagnostic_rows[0].keys())
-        writer.writeheader()
-        writer.writerows(diagnostic_rows)
+    if report_rows:
+        with report_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=report_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(report_rows)
+    if diagnostic_rows:
+        with diag_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=diagnostic_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(diagnostic_rows)
     print(f"output={args.out_dir}")
 
 

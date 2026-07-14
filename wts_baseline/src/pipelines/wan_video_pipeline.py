@@ -82,6 +82,7 @@ class WanPipelineConfig:
     output_width: int = 1280
     output_height: int = 720
     use_background_preservation: bool = True
+    use_3dgs: bool = False
     use_alpha_compositing: bool = True
     use_dynamic_cfg: bool = True
     use_step_caching: bool = True
@@ -98,13 +99,38 @@ class WanPipelineConfig:
     )
 
 
-def build_wan_prompt(caption: str, phase_label: int, sample_type: str) -> str:
+def estimate_motion_description(history_frames: Optional[torch.Tensor] = None) -> str:
+    """Estimate motion dynamics from history frames for prompt enrichment (Section II.2).
+    Computes pixel displacement between first and last history frame to infer velocity."""
+    if history_frames is None or history_frames.shape[1] < 2:
+        return ""
+    # history_frames: [B, T, C, H, W] in [-1,1] or [0,1]
+    first = history_frames[0, 0]  # [C, H, W]
+    last = history_frames[0, -1]
+    T = history_frames.shape[1]
+
+    # Compute mean pixel displacement as proxy for scene motion
+    diff = (last - first).abs().mean().item()
+
+    if diff < 0.02:
+        return "Scene is nearly static with minimal motion. "
+    elif diff < 0.06:
+        return "Objects are moving slowly with gradual changes. "
+    elif diff < 0.15:
+        return "Moderate motion with noticeable displacement of vehicles and pedestrians. "
+    else:
+        return "Significant rapid motion with large displacement. "
+
+
+def build_wan_prompt(caption: str, phase_label: int, sample_type: str, history_frames: Optional[torch.Tensor] = None) -> str:
     phase_name = PHASE_NAMES.get(int(phase_label), f"phase {int(phase_label)}")
     domain_name = DOMAIN_NAMES.get(sample_type, sample_type or "unknown camera")
+    motion_desc = estimate_motion_description(history_frames)
     return (
         f"Traffic video forecasting, {domain_name}, future {phase_name} phase, "
         f"highly detailed, high resolution, clear road layout, realistic motion, sharp focus. "
         f"Preserve camera viewpoint, road layout, actors, motion continuity, lighting, and scale. "
+        f"{motion_desc}"
         f"{caption}"
     )
 
@@ -390,6 +416,8 @@ class WanSOTAPipeline:
             ransac_threshold=self.config.ransac_threshold,
             motion_threshold=self.config.motion_threshold,
             flow_stride=self.config.flow_stride,
+            use_3dgs=self.config.use_3dgs,
+            device=self.device,
         )
         self.compositor = ForegroundBackgroundCompositor(
             use_depth_aware=False,

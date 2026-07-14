@@ -130,7 +130,9 @@ class Wan2_2V2VPipeline(HFWanPipeline):
         self._current_timestep = None
         self._interrupt = False
 
-        device = self.transformer.device
+        device = self.device
+        if device.type == "meta" or (device.type == "cpu" and torch.cuda.is_available()):
+            device = torch.device("cuda")
         transformer_dtype = self.transformer.dtype
 
         if prompt is not None and isinstance(prompt, str):
@@ -159,7 +161,15 @@ class Wan2_2V2VPipeline(HFWanPipeline):
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
         timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, timesteps, strength, device)
         latent_timestep = timesteps[:1].repeat(batch_size * num_videos_per_prompt)
-        self._num_timesteps = len(timesteps)
+        # Offload transformer and transformer_2 to CPU before VAE encoding
+        is_sequential_offload = hasattr(self.transformer, "_hf_hook")
+        if not is_sequential_offload:
+            self.transformer = self.transformer.to("cpu")
+            if hasattr(self, "transformer_2") and self.transformer_2 is not None:
+                self.transformer_2 = self.transformer_2.to("cpu")
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if latents is None:
             video_tensor = self.video_processor.preprocess_video(video, height=height, width=width).to(
@@ -181,6 +191,13 @@ class Wan2_2V2VPipeline(HFWanPipeline):
             latents,
             latent_timestep,
         )
+
+        # Offload VAE to CPU to save VRAM during transformer denoising
+        if not is_sequential_offload:
+            self.vae = self.vae.to("cpu")
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale
@@ -243,20 +260,30 @@ class Wan2_2V2VPipeline(HFWanPipeline):
                         use_transformer_2 = True
 
                 if use_transformer_2:
-                    if not is_on_gpu(self.transformer_2):
+                    if not is_sequential_offload and not is_on_gpu(self.transformer_2):
                         print(f"🔄 Hot-swapping at t={t_val:.1f}: Moving transformer to CPU and transformer_2 to {device}...")
+                        print(f"  [GPU Memory] Before offloading transformer: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
                         self.transformer = self.transformer.to("cpu")
+                        import gc
+                        gc.collect()
                         torch.cuda.empty_cache()
+                        print(f"  [GPU Memory] After offloading transformer: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
                         self.transformer_2 = self.transformer_2.to(device)
+                        print(f"  [GPU Memory] After loading transformer_2: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
                     active_transformer = self.transformer_2
                     active_guidance_scale = step_guidance_scale_2 if self.do_classifier_free_guidance else guidance_scale_2
                 else:
-                    if not is_on_gpu(self.transformer):
+                    if not is_sequential_offload and not is_on_gpu(self.transformer):
                         print(f"🔄 Hot-swapping at t={t_val:.1f}: Moving transformer_2 to CPU and transformer to {device}...")
+                        print(f"  [GPU Memory] Before offloading transformer_2: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
                         if hasattr(self, "transformer_2") and self.transformer_2 is not None:
                             self.transformer_2 = self.transformer_2.to("cpu")
+                        import gc
+                        gc.collect()
                         torch.cuda.empty_cache()
+                        print(f"  [GPU Memory] After offloading transformer_2: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
                         self.transformer = self.transformer.to(device)
+                        print(f"  [GPU Memory] After loading transformer: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
                     active_transformer = self.transformer
                     active_guidance_scale = step_guidance_scale if self.do_classifier_free_guidance else guidance_scale
 
@@ -297,6 +324,18 @@ class Wan2_2V2VPipeline(HFWanPipeline):
         self._current_timestep = None
 
         if not output_type == "latent":
+            if not is_sequential_offload:
+                # Offload transformer and transformer_2 to CPU to free VRAM for VAE decoding
+                self.transformer = self.transformer.to("cpu")
+                if hasattr(self, "transformer_2") and self.transformer_2 is not None:
+                    self.transformer_2 = self.transformer_2.to("cpu")
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # Move VAE back to GPU
+                self.vae = self.vae.to(device)
+
             latents = latents.to(self.vae.dtype)
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
@@ -307,7 +346,7 @@ class Wan2_2V2VPipeline(HFWanPipeline):
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            video = self.vae.decode(latents, return_dict=False)[0]
+            video = self.vae.decode(latents.to(device), return_dict=False)[0]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:
             video = latents

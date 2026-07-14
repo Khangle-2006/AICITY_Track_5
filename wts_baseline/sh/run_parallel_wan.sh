@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
+
+# Automatically navigate to repository root
+cd "$(dirname "$0")/.."
+mkdir -p logs
+
 set -euo pipefail
 
-# Parallel execution on 4 GPUs for Wan2.2 MoE Video-to-Video SOTA Inference
+# Parallel execution on 4 GPUs for Wan2.1 SOTA Video-to-Video Inference
+# Integrates: Wan2.1 DiT + optical flow background + alpha compositing + dynamic CFG + step caching
 
 export PYTHONPATH=/workspace/wts_baseline:${PYTHONPATH:-}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MANIFEST="${1:-data/manifests/test.jsonl}"
-OUTPUT_DIR="${2:-prediction_wan2.2_sota}"
-MODEL_ID="${3:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
+OUTPUT_DIR="${2:-prediction_wan_sota}"
+MODEL_ID="${3:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}"
 MAX_SAMPLES="${4:-0}"  # 0 means all samples
 
 EXTRA_ARGS=""
@@ -25,7 +31,7 @@ for RANK in $(seq 0 $((WORLD_SIZE - 1))); do
   GPU_ID=$RANK
   echo "Starting rank $RANK on GPU $GPU_ID..."
   
-  CUDA_VISIBLE_DEVICES=$GPU_ID python3 -u scripts/infer/infer_wan2_2.py \
+  CUDA_VISIBLE_DEVICES=$GPU_ID python3 -u scripts/infer/infer_wan.py \
     --manifest "$MANIFEST" \
     --output_dir "$OUTPUT_DIR" \
     --model_id "$MODEL_ID" \
@@ -45,14 +51,14 @@ for RANK in $(seq 0 $((WORLD_SIZE - 1))); do
     --use_background_preservation \
     --use_alpha_compositing \
     --use_dynamic_cfg \
-    --lambda_weight 0.1 \
+    --use_step_caching \
     --num_workers 2 \
     --rank "$RANK" \
     --world_size "$WORLD_SIZE" \
-    $EXTRA_ARGS > "rank_${RANK}.log" 2>&1 &
+    $EXTRA_ARGS > logs/rank_wan_${RANK}.log 2>&1 &
 done
 
-echo "All ranks launched. You can monitor progress with 'tail -f rank_*.log'."
+echo "All ranks launched. You can monitor progress with 'tail -f rank_wan_*.log'."
 echo "Waiting for all processes to finish..."
 wait
 echo "Parallel inference completed successfully!"

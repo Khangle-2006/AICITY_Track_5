@@ -190,7 +190,7 @@ def compute_motion_mask_from_warp(
         # Warp frame_src to dst viewpoint
         warped_src = F.grid_sample(
             frame_src[b:b+1], grid, mode="bilinear",
-            padding_mode="zeros", align_corners=True,
+            padding_mode="border", align_corners=True,
         )  # [1, C, H, W]
 
         # Pixel-wise difference (normalized in [0, 1] space)
@@ -245,7 +245,7 @@ def warp_background(
         grids.append(grid)
 
     grid = torch.stack(grids, dim=0)
-    warped = F.grid_sample(frame, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    warped = F.grid_sample(frame, grid, mode="bilinear", padding_mode="border", align_corners=True)
 
     return warped
 
@@ -301,6 +301,10 @@ class OpticalFlowDisentanglement(nn.Module):
             flow: [B, 2, H, W] - average optical flow
         """
         B, T, C, H, W = history_frames.shape
+
+        # Denormalize from [-1.0, 1.0] to [0.0, 1.0] if needed to prevent uint8 overflow in optical flow
+        if history_frames.min() < 0.0:
+            history_frames = (history_frames * 0.5 + 0.5).clamp(0.0, 1.0)
 
         # Use stride-based flow pairs for robust homography estimation
         flows = []
@@ -368,12 +372,283 @@ class OpticalFlowDisentanglement(nn.Module):
         return torch.stack(background_frames, dim=1)
 
 
+class Depth3DGSBackgroundPreservationModule(nn.Module):
+    """
+    3D Gaussian Splatting / 3D Point-Cloud Splatting Background Preservation.
+    Replaces 2D Homography warping with a 3D depth-aware camera-motion extrapolation
+    and GPU-based painter's algorithm z-buffer forward-splatting.
+    """
+    def __init__(self, device="cuda", ransac_threshold=1.0, motion_threshold=0.05, flow_stride=4):
+        super().__init__()
+        self.device = device
+        self.ransac_threshold = ransac_threshold
+        self.motion_threshold = motion_threshold
+        self.flow_stride = flow_stride
+        self.depth_model = None
+        self.depth_processor = None
+        
+    def _init_depth_model(self):
+        if self.depth_model is None:
+            from transformers import DPTForDepthEstimation, DPTImageProcessor
+            from pathlib import Path
+            cache_dir = Path("/workspace/depth75_solution/model_cache")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            print("  [3DGS BG] Loading DPT depth model on CPU...")
+            self.depth_processor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas", cache_dir=cache_dir)
+            self.depth_model = DPTForDepthEstimation.from_pretrained(
+                "Intel/dpt-hybrid-midas", cache_dir=cache_dir, torch_dtype=torch.float32
+            ).eval().to("cpu")
+
+    def estimate_depth(self, img_np):
+        self._init_depth_model()
+        with torch.no_grad():
+            inputs = self.depth_processor(images=img_np, return_tensors="pt")
+            inputs = {key: value.to("cpu") for key, value in inputs.items()}
+            prediction = self.depth_model(**inputs).predicted_depth[:, None]
+            prediction = torch.nn.functional.interpolate(
+                prediction, size=img_np.shape[:2], mode="bicubic", align_corners=False
+            )[0, 0]
+            inverse = prediction.float().cpu().numpy()
+            low, high = np.percentile(inverse[np.isfinite(inverse)], [2.0, 98.0])
+            normalized = np.clip((inverse - low) / max(high - low, 1e-6), 0.0, 1.0)
+            return (1.0 / (0.12 + normalized)).astype(np.float32)
+
+    def splat_frame_gpu(self, anchor, depth, static_mask, R, T, intrinsic, radius=1):
+        C, H, W = anchor.shape
+        device = anchor.device
+        
+        # Create grid of coordinates
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(0, H, device=device),
+            torch.arange(0, W, device=device),
+            indexing="ij"
+        )
+        grid_x = grid_x.reshape(-1)
+        grid_y = grid_y.reshape(-1)
+        
+        # Filter static pixels
+        mask_flat = static_mask.reshape(-1)
+        keep = mask_flat > 0.5
+        grid_x = grid_x[keep]
+        grid_y = grid_y[keep]
+        
+        if len(grid_x) == 0:
+            return anchor, torch.zeros(H, W, device=device)
+            
+        z = depth.reshape(-1)[keep]
+        colors = anchor.reshape(C, -1)[:, keep].t() # [M, C]
+        
+        # Back-project to 3D
+        fx, fy, cx, cy = intrinsic[0, 0], intrinsic[1, 1], intrinsic[0, 2], intrinsic[1, 2]
+        pts_3d = torch.stack([
+            (grid_x - cx) * z / fx,
+            (grid_y - cy) * z / fy,
+            z
+        ], dim=-1) # [M, 3]
+        
+        # Transform using R, T
+        transformed = pts_3d @ R.t() + T.t() # [M, 3]
+        
+        # Project back to 2D
+        z_proj = transformed[:, 2]
+        valid = z_proj > 1e-4
+        if not valid.any():
+            return torch.zeros_like(anchor), torch.zeros(H, W, device=device)
+            
+        transformed = transformed[valid]
+        colors = colors[valid]
+        z_proj = z_proj[valid]
+        
+        u_proj = fx * transformed[:, 0] / transformed[:, 2] + cx
+        v_proj = fy * transformed[:, 1] / transformed[:, 2] + cy
+        
+        u_int = torch.round(u_proj).long()
+        v_int = torch.round(v_proj).long()
+        
+        in_bounds = (u_int >= 0) & (u_int < W) & (v_int >= 0) & (v_int < H)
+        if not in_bounds.any():
+            return torch.zeros_like(anchor), torch.zeros(H, W, device=device)
+            
+        u_int = u_int[in_bounds]
+        v_int = v_int[in_bounds]
+        colors = colors[in_bounds]
+        z_proj = z_proj[in_bounds]
+        
+        if radius > 0:
+            offsets = []
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    offsets.append((dx, dy))
+            num_offsets = len(offsets)
+            
+            u_all = u_int.unsqueeze(1).repeat(1, num_offsets)
+            v_all = v_int.unsqueeze(1).repeat(1, num_offsets)
+            
+            for idx, (dx, dy) in enumerate(offsets):
+                u_all[:, idx] += dx
+                v_all[:, idx] += dy
+                
+            u_all = u_all.view(-1)
+            v_all = v_all.view(-1)
+            colors_all = colors.unsqueeze(1).repeat(1, num_offsets, 1).view(-1, C)
+            z_proj_all = z_proj.unsqueeze(1).repeat(1, num_offsets).view(-1)
+            
+            in_bounds_all = (u_all >= 0) & (u_all < W) & (v_all >= 0) & (v_all < H)
+            u_final = u_all[in_bounds_all]
+            v_final = v_all[in_bounds_all]
+            colors_final = colors_all[in_bounds_all]
+            z_final = z_proj_all[in_bounds_all]
+        else:
+            u_final = u_int
+            v_final = v_int
+            colors_final = colors
+            z_final = z_proj
+            
+        if len(u_final) == 0:
+            return torch.zeros_like(anchor), torch.zeros(H, W, device=device)
+            
+        idx_sort = torch.argsort(z_final, descending=True)
+        u_sorted = u_final[idx_sort]
+        v_sorted = v_final[idx_sort]
+        colors_sorted = colors_final[idx_sort]
+        
+        flat_idx = v_sorted * W + u_sorted
+        
+        canvas = torch.zeros(C, H * W, device=device)
+        canvas.scatter_(1, flat_idx.unsqueeze(0).expand(C, -1), colors_sorted.t())
+        rendered = canvas.view(C, H, W)
+        
+        coverage_flat = torch.zeros(H * W, device=device)
+        coverage_flat.scatter_(0, flat_idx, 1.0)
+        coverage = coverage_flat.view(H, W)
+        
+        return rendered, coverage
+
+    def forward(self, history_frames: torch.Tensor, num_future_frames: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = history_frames.device
+        B, T, C, H, W = history_frames.shape
+        
+        hist_denorm = history_frames
+        if history_frames.min() < 0.0:
+            hist_denorm = (history_frames * 0.5 + 0.5).clamp(0.0, 1.0)
+            
+        flow_module = OpticalFlowDisentanglement(
+            use_raft=False,
+            ransac_threshold=self.ransac_threshold,
+            motion_threshold=self.motion_threshold,
+            flow_stride=self.flow_stride,
+        ).to(device)
+        homography, motion_mask, _ = flow_module(hist_denorm)
+        
+        last_frame_np = (hist_denorm[0, -1].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        depth_np = self.estimate_depth(last_frame_np)
+        depth = torch.from_numpy(depth_np).to(device)
+        
+        img_prev = (hist_denorm[0, -2].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        img_curr = last_frame_np
+        
+        import cv2
+        orb = cv2.ORB_create(nfeatures=2000, fastThreshold=8)
+        kp1, des1 = orb.detectAndCompute(img_prev, None)
+        kp2, des2 = orb.detectAndCompute(img_curr, None)
+        
+        R_est, T_est = None, None
+        if des1 is not None and des2 is not None and len(kp1) > 20 and len(kp2) > 20:
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+            pairs = bf.knnMatch(des1, des2, k=2)
+            good_matches = []
+            for pair in pairs:
+                if len(pair) == 2:
+                    first, second = pair
+                    if first.distance < 0.75 * second.distance:
+                        good_matches.append(first)
+                        
+            if len(good_matches) >= 15:
+                pts_prev = np.float32([kp1[m.queryIdx].pt for m in good_matches])
+                pts_curr = np.float32([kp2[m.trainIdx].pt for m in good_matches])
+                
+                motion_mask_np = motion_mask[0, 0].cpu().numpy()
+                static_matches = []
+                for p_prev, p_curr in zip(pts_prev, pts_curr):
+                    x, y = int(p_prev[0]), int(p_prev[1])
+                    x = min(max(x, 0), W - 1)
+                    y = min(max(y, 0), H - 1)
+                    if motion_mask_np[y, x] < 0.5:
+                        static_matches.append((p_prev, p_curr))
+                        
+                if len(static_matches) >= 12:
+                    image_points = np.float32([m[1] for m in static_matches])
+                    pixels = np.float32([m[0] for m in static_matches])
+                    
+                    px = np.clip(np.rint(pixels[:, 0]).astype(int), 0, W - 1)
+                    py = np.clip(np.rint(pixels[:, 1]).astype(int), 0, H - 1)
+                    z = depth_np[py, px]
+                    
+                    focal = 0.9 * max(W, H)
+                    intrinsic_np = np.array([[focal, 0.0, W / 2.0], [0.0, focal, H / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+                    fx, fy, cx, cy = intrinsic_np[0, 0], intrinsic_np[1, 1], intrinsic_np[0, 2], intrinsic_np[1, 2]
+                    object_points = np.stack([(pixels[:, 0] - cx) * z / fx, (pixels[:, 1] - cy) * z / fy, z], axis=1)
+                    
+                    ok, rotation, translation, inliers = cv2.solvePnPRansac(
+                        object_points,
+                        image_points,
+                        intrinsic_np,
+                        None,
+                        iterationsCount=200,
+                        reprojectionError=5.0,
+                        confidence=0.99,
+                        flags=cv2.SOLVEPNP_EPNP,
+                    )
+                    if ok and inliers is not None and len(inliers) >= 8:
+                        R_est, _ = cv2.Rodrigues(rotation)
+                        T_est = translation.reshape(3, 1)
+                        
+        if R_est is None or T_est is None:
+            R_est = np.eye(3)
+            T_est = np.zeros((3, 1))
+            
+        poses_extrapolated = []
+        R_cum = np.eye(3)
+        T_cum = np.zeros((3, 1))
+        for k in range(num_future_frames):
+            T_cum = R_est @ T_cum + T_est
+            R_cum = R_cum @ R_est
+            poses_extrapolated.append((R_cum.copy(), T_cum.copy()))
+            
+        anchor = hist_denorm[0, -1] # [C, H, W]
+        static_mask = (motion_mask[0, 0] < 0.5).float() # [H, W]
+        
+        focal = 0.9 * max(W, H)
+        intrinsic = torch.tensor([[focal, 0.0, W / 2.0], [0.0, focal, H / 2.0], [0.0, 0.0, 1.0]], device=device, dtype=torch.float32)
+        
+        background_frames = []
+        for k in range(num_future_frames):
+            R_k, T_k = poses_extrapolated[k]
+            R_t = torch.from_numpy(R_k).to(device=device, dtype=torch.float32)
+            T_t = torch.from_numpy(T_k).to(device=device, dtype=torch.float32)
+            
+            rendered, coverage = self.splat_frame_gpu(anchor, depth, static_mask, R_t, T_t, intrinsic, radius=1)
+            
+            uncovered = (coverage < 0.5).unsqueeze(0).float()
+            rendered = rendered * (1.0 - uncovered) + anchor * uncovered
+            
+            background_frames.append(rendered)
+            
+        background = torch.stack(background_frames, dim=0).unsqueeze(0) # [1, num_future, C, H, W]
+        
+        if history_frames.min() < 0.0:
+            background = background * 2.0 - 1.0
+            
+        return background, motion_mask
+
+
 class BackgroundPreservationModule(nn.Module):
     """
     High-level background preservation module.
 
     Integrates optical flow disentanglement with deterministic warping
     to produce background frames that bypass the generative DiT entirely.
+    Supports either 2D Homography or 3D Gaussian Splatting (3DGS) warping.
     """
 
     def __init__(
@@ -383,15 +658,26 @@ class BackgroundPreservationModule(nn.Module):
         ransac_threshold: float = 1.0,
         motion_threshold: float = 0.05,
         flow_stride: int = 4,
+        use_3dgs: bool = False,
+        device: str = "cuda",
     ):
         super().__init__()
-        self.flow_module = OpticalFlowDisentanglement(
-            use_raft=use_raft,
-            raft_model_path=raft_model_path,
-            ransac_threshold=ransac_threshold,
-            motion_threshold=motion_threshold,
-            flow_stride=flow_stride,
-        )
+        self.use_3dgs = use_3dgs
+        if use_3dgs:
+            self.dgs_module = Depth3DGSBackgroundPreservationModule(
+                device=device,
+                ransac_threshold=ransac_threshold,
+                motion_threshold=motion_threshold,
+                flow_stride=flow_stride,
+            )
+        else:
+            self.flow_module = OpticalFlowDisentanglement(
+                use_raft=use_raft,
+                raft_model_path=raft_model_path,
+                ransac_threshold=ransac_threshold,
+                motion_threshold=motion_threshold,
+                flow_stride=flow_stride,
+            )
 
     def forward(
         self,
@@ -409,6 +695,9 @@ class BackgroundPreservationModule(nn.Module):
             background: [B, num_future, C, H, W] - deterministic background
             motion_mask: [B, 1, H, W] - foreground motion mask
         """
+        if self.use_3dgs:
+            return self.dgs_module(history_frames, num_future_frames)
+            
         homography, motion_mask, _ = self.flow_module(history_frames)
 
         last_frame = history_frames[:, -1]

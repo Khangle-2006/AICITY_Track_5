@@ -52,6 +52,34 @@ from src.models.adapters import (
 from src.pipelines.wan_video_pipeline import build_wan_prompt
 
 
+def localized_semantic_alignment_loss(pred, target, patch_size=4):
+    """
+    Compute Localized Semantic Alignment (LSA) loss to align local patch features
+    between predictions and targets, preserving object structures.
+    """
+    B, C, T, H, W = pred.shape
+    H_p = (H // patch_size) * patch_size
+    W_p = (W // patch_size) * patch_size
+    pred_crop = pred[:, :, :, :H_p, :W_p]
+    target_crop = target[:, :, :, :H_p, :W_p]
+    
+    # Extract local patches
+    pred_patches = pred_crop.unfold(3, patch_size, patch_size).unfold(4, patch_size, patch_size)
+    target_patches = target_crop.unfold(3, patch_size, patch_size).unfold(4, patch_size, patch_size)
+    
+    H_num = H_p // patch_size
+    W_num = W_p // patch_size
+    pred_flat = pred_patches.permute(0, 2, 3, 5, 1, 4, 6).reshape(B, T, H_num * W_num, C * patch_size * patch_size)
+    target_flat = target_patches.permute(0, 2, 3, 5, 1, 4, 6).reshape(B, T, H_num * W_num, C * patch_size * patch_size)
+    
+    pred_norm = F.normalize(pred_flat, p=2, dim=-1)
+    target_norm = F.normalize(target_flat, p=2, dim=-1)
+    
+    cos_sim = (pred_norm * target_norm).sum(dim=-1)
+    lsa_loss = (1.0 - cos_sim).mean()
+    return lsa_loss
+
+
 def create_pipeline(model_id: str, device: torch.device, dtype: torch.dtype):
     """Load WAN2.2 pipeline and return components."""
     print(f"📦 Loading {model_id}...")
@@ -268,8 +296,10 @@ def train_step(
     # Ground truth velocity target
     target_velocity = noise - latents_target
     
-    # 9. Compute MSE loss
-    loss = F.mse_loss(pred_target.float(), target_velocity.float(), reduction="mean")
+    # 9. Compute combined MSE and Localized Semantic Alignment (LSA) loss
+    mse_loss = F.mse_loss(pred_target.float(), target_velocity.float(), reduction="mean")
+    lsa_loss = localized_semantic_alignment_loss(pred_target.float(), target_velocity.float(), patch_size=4)
+    loss = mse_loss + 0.1 * lsa_loss
     
     return loss
 

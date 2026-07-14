@@ -29,6 +29,16 @@ def select_frame_paths(paths, max_frames=None, strategy="tail"):
         indices = torch.linspace(0, len(paths) - 1, steps=max_frames).round().long().tolist()
         return [paths[i] for i in indices]
 
+    if strategy == "sparse":
+        # Sparse sampling: take every 2nd frame from the end for wider temporal coverage
+        stride = 2
+        end_idx = len(paths)
+        start_idx = max(0, end_idx - max_frames * stride)
+        selected = paths[start_idx:end_idx:stride]
+        if len(selected) > max_frames:
+            selected = selected[-max_frames:]
+        return selected
+
     if strategy == "dense_tail":
         tail_count = max(1, int(max_frames * 0.75))
         head_count = max_frames - tail_count
@@ -126,6 +136,7 @@ class WTSDataset(Dataset):
         if self.is_train and torch.rand(1).item() < 0.5:
             history_tensor = torch.flip(history_tensor, dims=[-1])
 
+        history_indices = [sample["history_frames"].index(p) for p in history_paths]
         res = {
             "history_frames": history_tensor,
             "merged_caption": sample["merged_caption"],
@@ -133,6 +144,7 @@ class WTSDataset(Dataset):
             "scenario_name": scenario_name,
             "sample_type": sample.get("sample_type", infer_sample_type(scenario_name)),
             "history_paths": history_paths,
+            "history_indices": history_indices,
             "original_history_length": len(sample["history_frames"]),
         }
         if "frame_length" in sample:
