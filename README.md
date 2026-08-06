@@ -41,20 +41,13 @@ The table above reports its later official full-test evaluation.
 
 ## Overview
 
-```mermaid
-flowchart LR
-    A[Observed traffic clips] --> R{View route}
-    R -->|BDD front camera| B[LTX appearance base]
-    B --> T[LTXHF-T55 detail transfer]
-    T --> G[mf_h8 multi-frame geometry refinement]
-    R -->|WTS overhead or fixed| O[Actor-layer propagation]
-    R -->|WTS vehicle or IP| V[Region-normalized propagation]
-    G --> H[Hybrid assembly]
-    O --> H
-    V --> H
-    H --> Q[71 videos / 5,194 frames]
-    Q --> Z[Verified submission ZIP]
-```
+<div align="center">
+
+[![GeoRoute method overview](assets/pipeline_overview.png)](assets/pipeline_overview.pdf)
+
+<sub>GeoRoute method overview. Click the figure to open the vector PDF.</sub>
+
+</div>
 
 The `T55` stage transfers high-frequency residuals from a traffic-prompt LTX
 donor with strength `0.55`. The following renderer uses up to eight observed
