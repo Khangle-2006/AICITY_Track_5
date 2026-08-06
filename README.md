@@ -20,14 +20,6 @@ geometry refinement for BDD front-camera videos, and deterministic motion
 specialists for WTS traffic-camera views. The system is training-free: no
 generator weights are fine-tuned.
 
-> [!IMPORTANT]
-> A Git clone contains all pipeline code, validated settings, test indexing,
-> source-selection reports, and SHA-256 hashes for the official submission.
-> The challenge input videos and the archived BDD diffusion outputs are not
-> redistributed in Git because of access restrictions and size. See
-> [Reproducibility Scope](#reproducibility-scope) before claiming an exact
-> `73.2843` reproduction.
-
 ## Results
 
 Our submitted system ranked **5th** on the official full-test leaderboard.
