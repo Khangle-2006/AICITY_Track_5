@@ -1,6 +1,6 @@
 # GeoRoute / LTXHF-T55 Reproduction
 
-This directory contains the merged code path for the AI City Challenge 2026
+This repository contains the complete code path for the AI City Challenge 2026
 Track 5 submission labeled `ltxhf_t55`. The final system combines the original
 Depth75 renderer with the later LTXHF-T55 and multi-frame `mf_h8` improvements.
 
@@ -44,7 +44,7 @@ Dynamic actors and unreliable projections remain supplied by the base video.
 ## Repository Layout
 
 ```text
-depth75_solution/
+AICITY_Track_5/
   baseline/                         Track 5 I/O, WTS predictors, verification
   reports/
     hybrid_multiframe_...csv        Reference source-selection report
@@ -116,7 +116,7 @@ cd AICITY_Track_5
 conda create -n georoute python=3.10 -y
 conda activate georoute
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install -r depth75_solution/requirements.txt
+pip install -r requirements.txt
 ```
 
 The first geometry run downloads and caches:
@@ -136,8 +136,8 @@ Assume the extracted dataset is under `/data/Track_5`:
 cd AICITY_Track_5
 mkdir -p work/index
 
-python depth75_solution/scripts/relocate_test_index.py \
-  --template depth75_solution/test_index_hybrid.csv \
+python scripts/relocate_test_index.py \
+  --template test_index_hybrid.csv \
   --data-root /data/Track_5 \
   --output work/index/test_index.csv
 ```
@@ -171,7 +171,7 @@ DATA_ROOT=/data/Track_5 \
 WORK_ROOT="$PWD/work" \
 LTXHF_BASE=/data/artifacts/ltxhf_t55_bdd_test \
 CUDA_VISIBLE_DEVICES=0 \
-bash depth75_solution/scripts/run_full_pipeline.sh
+bash scripts/run_full_pipeline.sh
 ```
 
 The entrypoint performs the following operations:
@@ -196,7 +196,7 @@ Install the official LTX-Video runtime in a separate virtual environment:
 
 ```bash
 cd AICITY_Track_5
-bash depth75_solution/scripts/setup_ltx_video.sh
+bash scripts/setup_ltx_video.sh
 ```
 
 The setup script clones
@@ -215,12 +215,12 @@ MODE=regenerate \
 INDEX_DIR="$PWD/work/index" \
 DATA_ROOT=/data/Track_5 \
 WORK_ROOT="$PWD/work" \
-LTX_REPO="$PWD/depth75_solution/third_party/LTX-Video" \
-LTX_PYTHON="$PWD/depth75_solution/third_party/ltxv_env/bin/python" \
-PIPELINE_CONFIG="$PWD/depth75_solution/wan_ticft/evaluation/ltxv_2b_gate.yaml" \
+LTX_REPO="$PWD/third_party/LTX-Video" \
+LTX_PYTHON="$PWD/third_party/ltxv_env/bin/python" \
+PIPELINE_CONFIG="$PWD/wan_ticft/evaluation/ltxv_2b_gate.yaml" \
 SEED=17 \
 CUDA_VISIBLE_DEVICES=0 \
-bash depth75_solution/scripts/run_full_pipeline.sh
+bash scripts/run_full_pipeline.sh
 ```
 
 This mode generates a default LTX continuation and a traffic-detail donor for
@@ -228,7 +228,7 @@ each BDD sample, transfers donor high frequencies with `alpha=0.55`, and then
 runs the same `mf_h8`, WTS, assembly, verification, and packaging stages.
 
 All stages support path overrides through environment variables. Run
-`bash depth75_solution/scripts/run_full_pipeline.sh --help` for the minimum
+`bash scripts/run_full_pipeline.sh --help` for the minimum
 interface.
 
 ## Validated Parameters
@@ -284,7 +284,7 @@ interface.
 Structural verification:
 
 ```bash
-PYTHONPATH=depth75_solution python -m baseline.submission \
+PYTHONPATH=. python -m baseline.submission \
   --index_dir work/index \
   --gen_dir work/hybrid_multiframe_mf_h8_ltxhf_t55_wts_candidate \
   --submission_dir work/hybrid_multiframe_mf_h8_ltxhf_t55_wts_candidate \
@@ -294,9 +294,9 @@ PYTHONPATH=depth75_solution python -m baseline.submission \
 Byte-level verification against the official submitted PNGs:
 
 ```bash
-python depth75_solution/scripts/verify_exact_submission.py \
+python scripts/verify_exact_submission.py \
   --submission work/hybrid_multiframe_mf_h8_ltxhf_t55_wts_candidate \
-  --manifest depth75_solution/reports/official_73.2843_sha256.txt
+  --manifest reports/official_73.2843_sha256.txt
 ```
 
 Success ends with:
@@ -310,11 +310,11 @@ status=exact-match files=5194
 Static checks that do not require the dataset or GPU:
 
 ```bash
-python -m compileall -q depth75_solution
-PYTHONPATH=depth75_solution python -m unittest discover -s depth75_solution/tests
-bash -n depth75_solution/scripts/run_full_pipeline.sh
-bash -n depth75_solution/scripts/build_multiframe_ltxhf_t55_candidate.sh
-bash -n depth75_solution/scripts/setup_ltx_video.sh
+python -m compileall -q baseline scripts tests wan_ticft
+PYTHONPATH=. python -m unittest discover -s tests
+bash -n scripts/run_full_pipeline.sh
+bash -n scripts/build_multiframe_ltxhf_t55_candidate.sh
+bash -n scripts/setup_ltx_video.sh
 ```
 
 For a short end-to-end GPU test, create an index containing one BDD sample and

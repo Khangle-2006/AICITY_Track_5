@@ -20,10 +20,13 @@ Danh_Tien_workspace/
 **/prediction*/
 **/logs*/
 *.log
-wts_baseline/scratch/
 *.pt
 *.tar.gz
 **/model_cache/
 **/wts_classical_baseline/
 /work/
 **/third_party/
+
+# Pipeline-generated artifacts
+/outputs/
+*.zip
