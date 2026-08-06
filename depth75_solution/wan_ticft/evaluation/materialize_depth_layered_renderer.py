@@ -65,42 +65,12 @@ def write_video(cv2_module, frames, path: Path, fps: float, prepend_guard: bool 
     writer.release()
 
 
-def compute_raft_flow(models, img1, img2):
-    # Load RAFT model lazily
-    if not hasattr(models, 'raft_model'):
-        from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
-        models.raft_weights = Raft_Large_Weights.DEFAULT
-        models.raft_model = raft_large(weights=models.raft_weights).eval().to(models.device)
-        models.raft_transforms = models.raft_weights.transforms()
-        
-    h, w = img1.shape[:2]
-    h_pad = (8 - h % 8) % 8
-    w_pad = (8 - w % 8) % 8
-    if h_pad > 0 or w_pad > 0:
-        img1_padded = np.pad(img1, ((0, h_pad), (0, w_pad), (0, 0)), mode='edge')
-        img2_padded = np.pad(img2, ((0, h_pad), (0, w_pad), (0, 0)), mode='edge')
-    else:
-        img1_padded = img1
-        img2_padded = img2
-
-    t1 = torch.from_numpy(img1_padded).permute(2, 0, 1)[None].to(models.device)
-    t2 = torch.from_numpy(img2_padded).permute(2, 0, 1)[None].to(models.device)
-    t1_t, t2_t = models.raft_transforms(t1, t2)
-    
-    with torch.no_grad():
-        flow = models.raft_model(t1_t, t2_t)[-1][0].permute(1, 2, 0).cpu().numpy()
-        
-    flow = flow[:h, :w]
-    return flow
-
-
 class PerceptionModels:
     def __init__(self, device: torch.device, cache_dir: Path):
         from transformers import DPTForDepthEstimation, DPTImageProcessor
         from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights, deeplabv3_resnet50
 
         self.device = device
-        self.cache_dir = cache_dir
         self.depth_processor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas", cache_dir=cache_dir)
         self.depth_model = DPTForDepthEstimation.from_pretrained(
             "Intel/dpt-hybrid-midas", cache_dir=cache_dir, torch_dtype=torch.float32
@@ -111,168 +81,35 @@ class PerceptionModels:
         categories = weights.meta["categories"]
         self.actor_ids = {index for index, name in enumerate(categories) if name.lower() in ACTOR_NAMES}
 
-    def load_superpoint(self):
-        if not hasattr(self, 'superpoint'):
-            from lightglue import LightGlue, SuperPoint
-            self.superpoint = SuperPoint(max_num_keypoints=2048).eval().to(self.device)
-            self.lightglue = LightGlue(features='superpoint').eval().to(self.device)
-
-    def load_depth_anything(self, scale="small"):
-        repo_map = {
-            "small": "depth-anything/Depth-Anything-V2-Small-hf",
-            "base": "depth-anything/Depth-Anything-V2-Base-hf",
-            "large": "depth-anything/Depth-Anything-V2-Large-hf"
-        }
-        repo_id = repo_map.get(scale, "depth-anything/Depth-Anything-V2-Small-hf")
-        attr_name = f"depth_anything_{scale}"
-        attr_proc = f"depth_anything_processor_{scale}"
-        if not hasattr(self, attr_name):
-            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-            setattr(self, attr_proc, AutoImageProcessor.from_pretrained(repo_id, cache_dir=self.cache_dir))
-            setattr(self, attr_name, AutoModelForDepthEstimation.from_pretrained(
-                repo_id, cache_dir=self.cache_dir
-            ).eval().to(self.device))
-        return getattr(self, attr_proc), getattr(self, attr_name)
-
-    def load_yolo(self):
-        if not hasattr(self, 'yolo_model'):
-            from ultralytics import YOLO
-            self.yolo_model = YOLO("yolov8n-seg.pt").to(self.device)
-
-    def load_sam2(self):
-        if not hasattr(self, 'sam2_model'):
-            from transformers import Sam2VideoProcessor, Sam2VideoModel
-            self.sam2_processor = Sam2VideoProcessor.from_pretrained(
-                "facebook/sam2.1-hiera-tiny", cache_dir=self.cache_dir
-            )
-            self.sam2_model = Sam2VideoModel.from_pretrained(
-                "facebook/sam2.1-hiera-tiny", cache_dir=self.cache_dir, torch_dtype=torch.float32
-            ).eval().to(self.device)
+    @torch.inference_mode()
+    def depth(self, rgb: np.ndarray) -> np.ndarray:
+        inputs = self.depth_processor(images=rgb, return_tensors="pt")
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        prediction = self.depth_model(**inputs).predicted_depth[:, None]
+        prediction = torch.nn.functional.interpolate(
+            prediction, size=rgb.shape[:2], mode="bicubic", align_corners=False
+        )[0, 0]
+        inverse = prediction.float().cpu().numpy()
+        low, high = np.percentile(inverse[np.isfinite(inverse)], [2.0, 98.0])
+        normalized = np.clip((inverse - low) / max(high - low, 1e-6), 0.0, 1.0)
+        # MiDaS-family DPT output is inverse relative depth: larger means nearer.
+        return (1.0 / (0.12 + normalized)).astype(np.float32)
 
     @torch.inference_mode()
-    def depth(self, rgb: np.ndarray, model_type="midas") -> np.ndarray:
-        if model_type.startswith("depthanything"):
-            scale = "small"
-            if "base" in model_type:
-                scale = "base"
-            elif "large" in model_type:
-                scale = "large"
-            processor, model = self.load_depth_anything(scale=scale)
-            inputs = processor(images=rgb, return_tensors="pt")
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
-            prediction = model(**inputs).predicted_depth[:, None]
-            prediction = torch.nn.functional.interpolate(
-                prediction, size=rgb.shape[:2], mode="bicubic", align_corners=False
-            )[0, 0]
-            inverse = prediction.float().cpu().numpy()
-            low, high = np.percentile(inverse[np.isfinite(inverse)], [2.0, 98.0])
-            normalized = np.clip((inverse - low) / max(high - low, 1e-6), 0.0, 1.0)
-            return (1.0 / (0.12 + normalized)).astype(np.float32)
-        else:
-            inputs = self.depth_processor(images=rgb, return_tensors="pt")
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
-            prediction = self.depth_model(**inputs).predicted_depth[:, None]
-            prediction = torch.nn.functional.interpolate(
-                prediction, size=rgb.shape[:2], mode="bicubic", align_corners=False
-            )[0, 0]
-            inverse = prediction.float().cpu().numpy()
-            low, high = np.percentile(inverse[np.isfinite(inverse)], [2.0, 98.0])
-            normalized = np.clip((inverse - low) / max(high - low, 1e-6), 0.0, 1.0)
-            return (1.0 / (0.12 + normalized)).astype(np.float32)
-
-    @torch.inference_mode()
-    def actor_masks(self, frames: list[np.ndarray], batch_size: int, model_type="deeplabv3") -> list[np.ndarray]:
-        if model_type == "sam2":
-            self.load_sam2()
-            self.load_yolo()
-            
-            anchor = frames[0]
-            height, width = anchor.shape[:2]
-            anchor_bgr = cv2.cvtColor(anchor, cv2.COLOR_RGB2BGR)
-            results = self.yolo_model(anchor_bgr, verbose=False)[0]
-            
-            boxes = []
-            if results.boxes is not None:
-                for box in results.boxes:
-                    cls_id = int(box.cls[0].cpu().item())
-                    cls_name = self.yolo_model.names[cls_id].lower()
-                    if cls_name in ACTOR_NAMES:
-                        xyxy = box.xyxy[0].cpu().numpy().tolist()
-                        boxes.append(xyxy)
-                        
-            if not boxes:
-                return [np.zeros((height, width), dtype=np.float32) for _ in frames]
-                
-            session = self.sam2_processor.init_video_session(frames, inference_device=str(self.device))
-            obj_ids = list(range(len(boxes)))
-            input_boxes = [boxes]
-            self.sam2_processor.add_inputs_to_inference_session(
-                inference_session=session,
-                frame_idx=0,
-                obj_ids=obj_ids,
-                input_boxes=input_boxes
-            )
-            
-            frame_masks = {i: np.zeros((height, width), dtype=np.uint8) for i in range(len(frames))}
-            for out in self.sam2_model.propagate_in_video_iterator(session, start_frame_idx=0):
-                frame_idx = out.frame_idx
-                pred_masks = out.pred_masks
-                
-                res_masks = self.sam2_processor.post_process_masks(
-                    [pred_masks],
-                    original_sizes=[[height, width]],
-                    binarize=True
-                )[0]
-                
-                if res_masks.shape[0] > 0:
-                    combined_mask = (res_masks.sum(dim=(0, 1)) > 0).cpu().numpy().astype(np.uint8) * 255
-                    frame_masks[frame_idx] = combined_mask
-                    
-            masks = []
-            for i in range(len(frames)):
-                mask = frame_masks[i]
-                mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=1)
-                mask = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), 2.0)
-                masks.append(np.clip(mask, 0.0, 1.0))
-            return masks
-        elif model_type == "yolov8":
-            self.load_yolo()
-            masks = []
-            for frame in frames:
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                results = self.yolo_model(frame_bgr, verbose=False)[0]
-                if results.masks is not None:
-                    actor_indices = []
-                    for idx, cls_id in enumerate(results.boxes.cls.cpu().numpy()):
-                        cls_name = self.yolo_model.names[int(cls_id)].lower()
-                        if cls_name in ACTOR_NAMES:
-                            actor_indices.append(idx)
-                    if actor_indices:
-                        actor_masks_list = results.masks.data[actor_indices].cpu().numpy()
-                        mask = (actor_masks_list.sum(axis=0) > 0.5).astype(np.uint8) * 255
-                    else:
-                        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-                else:
-                    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    def actor_masks(self, frames: list[np.ndarray], batch_size: int) -> list[np.ndarray]:
+        masks = []
+        for start in range(0, len(frames), batch_size):
+            batch = frames[start : start + batch_size]
+            tensors = [self.segment_transform(torch.from_numpy(frame).permute(2, 0, 1)) for frame in batch]
+            logits = self.segment_model(torch.stack(tensors).to(self.device))["out"]
+            labels = logits.argmax(1).cpu().numpy()
+            for label, frame in zip(labels, batch):
+                mask = np.isin(label, list(self.actor_ids)).astype(np.uint8) * 255
                 mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
                 mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=1)
                 mask = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), 2.0)
                 masks.append(np.clip(mask, 0.0, 1.0))
-            return masks
-        else:
-            masks = []
-            for start in range(0, len(frames), batch_size):
-                batch = frames[start : start + batch_size]
-                tensors = [self.segment_transform(torch.from_numpy(frame).permute(2, 0, 1)) for frame in batch]
-                logits = self.segment_model(torch.stack(tensors).to(self.device))["out"]
-                labels = logits.argmax(1).cpu().numpy()
-                for label, frame in zip(labels, batch):
-                    mask = np.isin(label, list(self.actor_ids)).astype(np.uint8) * 255
-                    mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-                    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=1)
-                    mask = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), 2.0)
-                    masks.append(np.clip(mask, 0.0, 1.0))
-            return masks
+        return masks
 
 
 def camera_matrix(width: int, height: int, focal_scale: float) -> np.ndarray:
@@ -280,106 +117,49 @@ def camera_matrix(width: int, height: int, focal_scale: float) -> np.ndarray:
     return np.array([[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
-def estimate_pose(anchor, base, depth, actor_mask, intrinsic, min_matches: int, min_inliers: int, models=None, matcher="orb"):
-    if matcher == "superpoint" and models is not None:
-        models.load_superpoint()
-        img_anchor = torch.from_numpy(anchor).permute(2, 0, 1).float().to(models.device) / 255.0
-        img_base = torch.from_numpy(base).permute(2, 0, 1).float().to(models.device) / 255.0
-        
-        with torch.no_grad():
-            feats_anchor = models.superpoint({'image': img_anchor[None]})
-            feats_base = models.superpoint({'image': img_base[None]})
-            
-            # Guard against zero or insufficient keypoints
-            if feats_anchor['keypoints'].shape[1] < min_matches or feats_base['keypoints'].shape[1] < min_matches:
-                return None, {"matches": 0, "inliers": 0, "reprojection": 999.0}
-                
-            matches_dict = models.lightglue({'image0': feats_anchor, 'image1': feats_base})
-            
-            from lightglue.utils import rbd
-            feats_anchor, feats_base, matches_dict = [rbd(x) for x in [feats_anchor, feats_base, matches_dict]]
-            
-        key_anchor = feats_anchor['keypoints'].cpu().numpy()
-        key_base = feats_base['keypoints'].cpu().numpy()
-        matches = matches_dict['matches'].cpu().numpy()
-        
-        good_matches = []
-        for m in matches:
-            idx0, idx1 = m
-            x, y = key_anchor[idx0]
-            xi, yi = int(round(x)), int(round(y))
-            if actor_mask[min(max(yi, 0), actor_mask.shape[0] - 1), min(max(xi, 0), actor_mask.shape[1] - 1)] < 0.1:
-                good_matches.append((key_anchor[idx0], key_base[idx1]))
-                
-        if len(good_matches) < min_matches:
-            return None, {"matches": len(good_matches), "inliers": 0, "reprojection": 999.0}
-            
-        image_points = np.float32([m[1] for m in good_matches])
-        pixels = np.float32([m[0] for m in good_matches])
-        px = np.clip(np.rint(pixels[:, 0]).astype(int), 0, depth.shape[1] - 1)
-        py = np.clip(np.rint(pixels[:, 1]).astype(int), 0, depth.shape[0] - 1)
-        z = depth[py, px]
-        fx, fy, cx, cy = intrinsic[0, 0], intrinsic[1, 1], intrinsic[0, 2], intrinsic[1, 2]
-        object_points = np.stack([(pixels[:, 0] - cx) * z / fx, (pixels[:, 1] - cy) * z / fy, z], axis=1)
-        ok, rotation, translation, inliers = cv2.solvePnPRansac(
-            object_points,
-            image_points,
-            intrinsic,
-            None,
-            iterationsCount=300,
-            reprojectionError=5.0,
-            confidence=0.999,
-            flags=cv2.SOLVEPNP_EPNP,
-        )
-        inlier_count = len(inliers) if ok and inliers is not None else 0
-        if not ok or inlier_count < min_inliers:
-            return None, {"matches": len(good_matches), "inliers": inlier_count, "reprojection": 999.0}
-        projected, _ = cv2.projectPoints(object_points[inliers[:, 0]], rotation, translation, intrinsic, None)
-        error = np.linalg.norm(projected[:, 0] - image_points[inliers[:, 0]], axis=1).mean()
-        return (rotation, translation), {"matches": len(good_matches), "inliers": inlier_count, "reprojection": float(error)}
-    else:
-        anchor_gray = cv2.cvtColor(anchor, cv2.COLOR_RGB2GRAY)
-        base_gray = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY)
-        orb = cv2.ORB_create(nfeatures=3000, fastThreshold=8)
-        key_anchor, desc_anchor = orb.detectAndCompute(anchor_gray, None)
-        key_base, desc_base = orb.detectAndCompute(base_gray, None)
-        if desc_anchor is None or desc_base is None:
-            return None, {"matches": 0, "inliers": 0, "reprojection": 999.0}
-        pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(desc_anchor, desc_base, k=2)
-        good = []
-        for pair in pairs:
-            if len(pair) != 2:
-                continue
-            first, second = pair
-            x, y = key_anchor[first.queryIdx].pt
-            xi, yi = int(round(x)), int(round(y))
-            if first.distance < 0.72 * second.distance and actor_mask[min(max(yi, 0), actor_mask.shape[0] - 1), min(max(xi, 0), actor_mask.shape[1] - 1)] < 0.1:
-                good.append(first)
-        if len(good) < min_matches:
-            return None, {"matches": len(good), "inliers": 0, "reprojection": 999.0}
-        image_points = np.float32([key_base[item.trainIdx].pt for item in good])
-        pixels = np.float32([key_anchor[item.queryIdx].pt for item in good])
-        px = np.clip(np.rint(pixels[:, 0]).astype(int), 0, depth.shape[1] - 1)
-        py = np.clip(np.rint(pixels[:, 1]).astype(int), 0, depth.shape[0] - 1)
-        z = depth[py, px]
-        fx, fy, cx, cy = intrinsic[0, 0], intrinsic[1, 1], intrinsic[0, 2], intrinsic[1, 2]
-        object_points = np.stack([(pixels[:, 0] - cx) * z / fx, (pixels[:, 1] - cy) * z / fy, z], axis=1)
-        ok, rotation, translation, inliers = cv2.solvePnPRansac(
-            object_points,
-            image_points,
-            intrinsic,
-            None,
-            iterationsCount=300,
-            reprojectionError=5.0,
-            confidence=0.999,
-            flags=cv2.SOLVEPNP_EPNP,
-        )
-        inlier_count = len(inliers) if ok and inliers is not None else 0
-        if not ok or inlier_count < min_inliers:
-            return None, {"matches": len(good), "inliers": inlier_count, "reprojection": 999.0}
-        projected, _ = cv2.projectPoints(object_points[inliers[:, 0]], rotation, translation, intrinsic, None)
-        error = np.linalg.norm(projected[:, 0] - image_points[inliers[:, 0]], axis=1).mean()
-        return (rotation, translation), {"matches": len(good), "inliers": inlier_count, "reprojection": float(error)}
+def estimate_pose(anchor, base, depth, actor_mask, intrinsic, min_matches: int, min_inliers: int):
+    anchor_gray = cv2.cvtColor(anchor, cv2.COLOR_RGB2GRAY)
+    base_gray = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY)
+    orb = cv2.ORB_create(nfeatures=3000, fastThreshold=8)
+    key_anchor, desc_anchor = orb.detectAndCompute(anchor_gray, None)
+    key_base, desc_base = orb.detectAndCompute(base_gray, None)
+    if desc_anchor is None or desc_base is None:
+        return None, {"matches": 0, "inliers": 0, "reprojection": 999.0}
+    pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(desc_anchor, desc_base, k=2)
+    good = []
+    for pair in pairs:
+        if len(pair) != 2:
+            continue
+        first, second = pair
+        x, y = key_anchor[first.queryIdx].pt
+        xi, yi = int(round(x)), int(round(y))
+        if first.distance < 0.72 * second.distance and actor_mask[min(max(yi, 0), actor_mask.shape[0] - 1), min(max(xi, 0), actor_mask.shape[1] - 1)] < 0.1:
+            good.append(first)
+    if len(good) < min_matches:
+        return None, {"matches": len(good), "inliers": 0, "reprojection": 999.0}
+    image_points = np.float32([key_base[item.trainIdx].pt for item in good])
+    pixels = np.float32([key_anchor[item.queryIdx].pt for item in good])
+    px = np.clip(np.rint(pixels[:, 0]).astype(int), 0, depth.shape[1] - 1)
+    py = np.clip(np.rint(pixels[:, 1]).astype(int), 0, depth.shape[0] - 1)
+    z = depth[py, px]
+    fx, fy, cx, cy = intrinsic[0, 0], intrinsic[1, 1], intrinsic[0, 2], intrinsic[1, 2]
+    object_points = np.stack([(pixels[:, 0] - cx) * z / fx, (pixels[:, 1] - cy) * z / fy, z], axis=1)
+    ok, rotation, translation, inliers = cv2.solvePnPRansac(
+        object_points,
+        image_points,
+        intrinsic,
+        None,
+        iterationsCount=300,
+        reprojectionError=5.0,
+        confidence=0.999,
+        flags=cv2.SOLVEPNP_EPNP,
+    )
+    inlier_count = len(inliers) if ok and inliers is not None else 0
+    if not ok or inlier_count < min_inliers:
+        return None, {"matches": len(good), "inliers": inlier_count, "reprojection": 999.0}
+    projected, _ = cv2.projectPoints(object_points[inliers[:, 0]], rotation, translation, intrinsic, None)
+    error = np.linalg.norm(projected[:, 0] - image_points[inliers[:, 0]], axis=1).mean()
+    return (rotation, translation), {"matches": len(good), "inliers": inlier_count, "reprojection": float(error)}
 
 
 def raw_pose_quality(diagnostic: dict) -> float:
@@ -471,14 +251,8 @@ def render_confidence(
     return np.clip(confidence, 0.0, 1.0)
 
 
-def compose(base, rendered, confidence, alpha: float, depth=None, use_depth_weighting=False):
-    if use_depth_weighting and depth is not None:
-        depth_horizon = np.percentile(depth, 75)
-        weight_map = np.exp(-depth / max(depth_horizon, 1e-6))
-        weight_map = np.clip(weight_map, 0.0, 1.0)[..., None]
-        weight = np.clip(alpha * confidence * weight_map, 0.0, 0.85)
-    else:
-        weight = np.clip(alpha * confidence, 0.0, 0.85)[..., None]
+def compose(base, rendered, confidence, alpha: float):
+    weight = np.clip(alpha * confidence, 0.0, 0.85)[..., None]
     output = base.astype(np.float32) * (1.0 - weight) + rendered.astype(np.float32) * weight
     return np.clip(output, 0, 255).astype(np.uint8)
 
@@ -520,16 +294,6 @@ def main() -> None:
     parser.add_argument("--filled_pose_scale", type=float, default=0.35)
     parser.add_argument("--confidence_ema", type=float, default=0.65)
     parser.add_argument("--clean", action="store_true")
-    
-    # New options
-    parser.add_argument("--matcher", default="orb", choices=["orb", "superpoint"])
-    parser.add_argument("--depth_model", default="midas", choices=["midas", "depthanything", "depthanything_small", "depthanything_base", "depthanything_large"])
-    parser.add_argument("--segment_model", default="deeplabv3", choices=["deeplabv3", "yolov8", "sam2"])
-    parser.add_argument("--disocclusion_inpainting", action="store_true")
-    parser.add_argument("--alpha_decay", default="none", choices=["none", "linear", "exponential"])
-    parser.add_argument("--alpha_decay_rate", type=float, default=0.95)
-    parser.add_argument("--alpha_depth_weighting", action="store_true")
-
     args = parser.parse_args()
 
     cv2_module, _ = import_cv2_np()
@@ -558,7 +322,7 @@ def main() -> None:
     device = torch.device("cuda")
     models = PerceptionModels(device, args.model_cache)
     variants = {f"depth_layered_a{int(round(alpha * 100)):02d}": alpha for alpha in args.alphas}
-    if args.horizon_decay or args.alpha_decay != "none":
+    if args.horizon_decay:
         variants["depth_layered_hdecay"] = args.horizon_decay_alpha
     reports = {name: [] for name in variants}
     diagnostics = []
@@ -583,22 +347,16 @@ def main() -> None:
             anchor_source = override
         anchor = cv2.resize(anchor_source, (width, height), interpolation=cv2.INTER_AREA)
         bases = [cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA) for frame in bases]
-        
-        # Load custom depth model if requested
-        depth = models.depth(anchor, model_type=args.depth_model)
-        
-        # Load custom segmentation model if requested
-        masks = models.actor_masks([anchor, *bases], args.segment_batch, model_type=args.segment_model)
+        depth = models.depth(anchor)
+        masks = models.actor_masks([anchor, *bases], args.segment_batch)
         anchor_actor, base_actors = masks[0], masks[1:]
         static_mask = (anchor_actor < 0.1).astype(np.float32)
         intrinsic = camera_matrix(width, height, args.focal_scale)
         outputs = {name: [] for name in variants}
         raw_poses, pose_diagnostics, raw_qualities = [], [], []
-        
         for base in bases:
             pose, pose_diag = estimate_pose(
-                anchor, base, depth, anchor_actor, intrinsic, args.min_matches, args.min_inliers,
-                models=models, matcher=args.matcher
+                anchor, base, depth, anchor_actor, intrinsic, args.min_matches, args.min_inliers
             )
             raw_poses.append(pose)
             pose_diagnostics.append(pose_diag)
@@ -616,22 +374,6 @@ def main() -> None:
                 coverage = np.zeros((height, width), dtype=np.float32)
             else:
                 rendered, coverage = zbuffer_splat(anchor, depth, static_mask, pose, intrinsic, args.point_stride, args.splat_radius)
-                
-                # Pro-active disocclusion inpainting using RAFT
-                if args.disocclusion_inpainting:
-                    disocclusion_mask = ((static_mask > 0.5) & (coverage < 0.1)).astype(np.float32)
-                    if disocclusion_mask.sum() > 0:
-                        flow = compute_raft_flow(models, anchor, base)
-                        flow_y, flow_x = flow[..., 1], flow[..., 0]
-                        grid_y, grid_x = np.mgrid[0:height, 0:width]
-                        map_x = (grid_x + flow_x).astype(np.float32)
-                        map_y = (grid_y + flow_y).astype(np.float32)
-                        warped = cv2.remap(anchor, map_x, map_y, cv2.INTER_LINEAR)
-                        
-                        blend_mask = cv2.GaussianBlur(disocclusion_mask, (5, 5), 0.0)[..., None]
-                        rendered = (rendered.astype(np.float32) * (1.0 - blend_mask) + warped.astype(np.float32) * blend_mask).astype(np.uint8)
-                        coverage = np.clip(coverage + disocclusion_mask, 0.0, 1.0)
-                        
             confidence = render_confidence(
                 base,
                 rendered,
@@ -644,20 +386,11 @@ def main() -> None:
             )
             for name, alpha in variants.items():
                 effective_alpha = alpha
-                if name == "depth_layered_hdecay":
-                    if args.alpha_decay == "linear":
-                        effective_alpha = alpha * (1.0 - frame_index / len(bases))
-                    elif args.alpha_decay == "exponential":
-                        effective_alpha = alpha * (args.alpha_decay_rate ** frame_index)
-                    elif args.horizon_decay and frame_index > args.horizon_decay_start:
-                        span = max(1, args.horizon_decay_end - args.horizon_decay_start)
-                        progress = min(1.0, (frame_index - args.horizon_decay_start) / span)
-                        effective_alpha = alpha + progress * (args.horizon_decay_floor - alpha)
-                        
-                outputs[name].append(compose(
-                    base, rendered, confidence, effective_alpha, 
-                    depth=depth, use_depth_weighting=args.alpha_depth_weighting
-                ))
+                if name == "depth_layered_hdecay" and frame_index > args.horizon_decay_start:
+                    span = max(1, args.horizon_decay_end - args.horizon_decay_start)
+                    progress = min(1.0, (frame_index - args.horizon_decay_start) / span)
+                    effective_alpha = alpha + progress * (args.horizon_decay_floor - alpha)
+                outputs[name].append(compose(base, rendered, confidence, effective_alpha))
             previous_confidence = confidence
             diagnostics.append(
                 {

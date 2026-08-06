@@ -4,5 +4,6 @@ __pycache__/
 outputs/
 data/
 checkpoints/
+third_party/
 *.log
 *.zip

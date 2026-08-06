@@ -25,3 +25,5 @@ wts_baseline/scratch/
 *.tar.gz
 **/model_cache/
 **/wts_classical_baseline/
+/work/
+**/third_party/
